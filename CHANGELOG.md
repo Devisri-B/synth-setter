@@ -1,6 +1,168 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-04-20)
+
+### Documentation
+
+- Add CLAUDE.md GPU verification rule to prevent false skips
+  ([#640](https://github.com/tinaudio/synth-setter/pull/640),
+  [`7ad9afb`](https://github.com/tinaudio/synth-setter/commit/7ad9afbee99039180d87e60590b5756802117ec5))
+
+* docs: add CLAUDE.md GPU verification rule to prevent false skips
+
+Fixes #639
+
+* Apply suggestions from code review
+
+Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+- **documentation**: Clarify W&B opt-in in README and getting-started
+  ([#632](https://github.com/tinaudio/synth-setter/pull/632),
+  [`e8cfab5`](https://github.com/tinaudio/synth-setter/commit/e8cfab58fa506e99fd0dd020d72283780f345f2b))
+
+* docs: clarify W&B opt-in in README and getting-started
+
+PR #612 makes W&B opt-in (CSV + TensorBoard is the new default logger compose). Two reader-facing
+  docs still framed W&B as always-on:
+
+- README Features line + post-install blockquote now state W&B is opt-in and point to the
+  enable/disable workflow in getting-started §4c. - getting-started §3a / §4c / §5b re-framed around
+  the new default. §4c now has explicit Disabled / Enabled-per-run / Enabled-by-default paths; §5b's
+  stale `logger=tensorboard` override example replaced with `logger=wandb` (TensorBoard is already
+  in the default compose). - Removed the hard-coded `WANDB_ENTITY=tinaudio` example so external
+  users don't route runs to the tinaudio org by default.
+
+Refs #602, refs #598.
+
+* docs: preserve §4c anchor — move opt-in flag from heading to body
+
+The '— opt-in' suffix in the § heading changed the GitHub slug from '#4c-weights--biases-wb' to
+  '#4c-weights--biases-wb--opt-in', breaking three existing in-repo links. Keeping the original
+  heading preserves the anchor; the opt-in framing is bolded in the first sentence of the body
+  instead.
+
+Refs #602.
+
+* docs: keep README W&B blockquote inline code on one line
+
+Inline code span broke across a newline (`python src/train.py` opened on one line, `logger=wandb`
+  closed on the next), so GFM rendered the closing backtick as a literal character. Reshaped the
+  sentence so the `logger=wandb` reference sits on a single line.
+
+### Features
+
+- **data**: Enable standalone mode=validate for KSinDataModule + coverage test
+  ([#636](https://github.com/tinaudio/synth-setter/pull/636),
+  [`31aa1a4`](https://github.com/tinaudio/synth-setter/commit/31aa1a4782695e41220a86240023789cc7648ae0))
+
+* test(testing): add test_train_validate to cover eval.py mode=validate path
+
+Mirrors test_train_eval but sets cfg_eval.mode = "validate" so evaluate() exercises the
+  trainer.validate(...) branch at src/eval.py:91, which previously had zero coverage. Asserts
+  val/acc parity between the training run and the checkpoint re-validation.
+
+Fixes #635
+
+* fix(testing): address Copilot review on test_train_validate
+
+Three fixes in tests/test_eval.py::test_train_validate:
+
+- Remove `cfg_train.test = True` — unused post-train test phase wastes work for a validate-path test
+  (comment 3112319113). - Align eval ckpt load: set `cfg_eval.model = cfg_train.model` and
+  `cfg_eval.callbacks = cfg_train.callbacks` so the trained `ffn` checkpoint loads (comment
+  3112319151). - Assert on `val/loss` instead of `val/acc`; `ksin_ff_module` only logs `val/loss`.
+  Mirrors the `test/loss` pattern from test_train_eval (comment 3112319183).
+
+* fix(testing): disable post-train test phase in test_train_validate
+
+The prior round removed cfg_train.test = True but did not set it to False. Since configs/train.yaml
+  defaults test: True, train() still ran the post-training trainer.test(...) phase, defeating the
+  GPU-time reduction.
+
+Explicitly set cfg_train.test = False so the post-train test phase is skipped under validate-mode
+  coverage.
+
+* fix(testing): mirror limit_val_batches in test_train_validate cfg_eval
+
+The parity assertion abs(train[val/loss] - val[val/loss]) < 0.001 in test_train_validate cannot hold
+  unless the standalone evaluate() run uses the same val-set subset as the training run.
+  cfg_train_global sets trainer.limit_val_batches=0.1, but cfg_eval_global only sets
+  trainer.limit_test_batches=0.1, so without mirroring the flag the val set runs unrestricted
+  (default 1.0) inside evaluate() and produces a different val/loss than training reports.
+
+Align limit_val_batches alongside the existing data/model/callbacks mirror in the
+  open_dict(cfg_eval) block.
+
+Refs #635
+
+* fix(testing): handle stage=validate in KSinDataModule.setup
+
+`src/data/ksin_datamodule.py`'s previous `if stage == "fit": ... else: self.test = ...` gate never
+  built `self.val` when Lightning called `setup(stage="validate")` during `trainer.validate()`, so
+  `val_dataloader()` returned a missing attribute and `tests/test_eval.py::test_train_validate`
+  crashed with AttributeError.
+
+Restructured to three independent stage-indexed branches (fit -> train, {fit, validate} -> val,
+  {test, predict} -> test), matching Lightning's canonical DataModule pattern. See
+  https://lightning.ai/docs/pytorch/stable/data/datamodule.html.
+
+With this fix, `pytest tests/test_eval.py::test_train_validate -m "slow and gpu" -v` passes (7:47 on
+  RTX 5060 Ti). The parity assertion `abs(train_val_loss - eval_val_loss) < 0.001` holds because
+  `cfg_eval.trainer.limit_val_batches` was already pinned to `cfg_train.trainer.limit_val_batches`
+  in 779035d.
+
+`kosc_datamodule.py` and `fm_datamodule.py` have the same latent stage-gate bug but are out of scope
+  for this PR — followup issue will track.
+
+Addresses Copilot review comments r3112823274 and r3112823310.
+
+Refs #635.
+
+### Monitoring
+
+- **loggers**: Make W&B opt-in, default to CSV + TensorBoard
+  ([#612](https://github.com/tinaudio/synth-setter/pull/612),
+  [`f2f508a`](https://github.com/tinaudio/synth-setter/commit/f2f508a9051b7726a96d68b06dd7338f01efd347))
+
+* feat(monitoring): make W&B optional, default to TensorBoard
+
+- Drive logger selection from env vars: if WANDB_API_KEY is unset, use TensorBoard (the new
+  default). - Remove the hardcoded tinaudio fallback from configs/logger/wandb.yaml. - Add the set
+  -a && source .env; set +a snippet to .env.example.
+
+External users can now run the project end-to-end without a W&B account. Existing WANDB_API_KEY=...
+  workflows continue to work unchanged.
+
+Closes #598
+
+* refactor(monitoring): drop W&B from default many_loggers compose
+
+Simpler than the runtime WANDB_API_KEY gate: make the default logger composition CSV + TensorBoard
+  and leave W&B as an explicit opt-in (logger=wandb). No env-var side channel in Python; what you
+  configure is what you get.
+
+- configs/logger/many_loggers.yaml: compose csv + tensorboard (drop wandb) - configs/train.yaml:
+  default stays logger=many_loggers - src/utils/instantiators.py: remove the WANDB_API_KEY gate -
+  tests/test_instantiators.py: deleted (no gate to test) - docs/reference/wandb-integration.md:
+  update the init table
+
+* docs: align .env.example and wandb-integration.md with null entity default
+
+Three follow-on doc items from the same change:
+
+- .env.example: comment out WANDB_ENTITY/WANDB_PROJECT and add guidance that WANDB_ENTITY is
+  optional — leaving it unset defers to the user's W&B default entity, matching the new
+  `${oc.env:WANDB_ENTITY,null}` resolver in configs/logger/wandb.yaml. The prior live value
+  (WANDB_ENTITY=tinaudio) routed fresh users' runs to the upstream org. -
+  docs/reference/wandb-integration.md §5 gap #1: update the resolved gap note — entity now defaults
+  to `null`, not `tinaudio`. - docs/reference/wandb-integration.md Code version marker: bump from
+  3e60c47/main to 0b55a9e/feat/wandb-optional-by-default so readers know which snapshot the tables
+  describe.
+
+
 ## v0.2.1 (2026-04-20)
 
 ### Bug Fixes
