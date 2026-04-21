@@ -1,6 +1,107 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-04-21)
+
+### Features
+
+- **dataset**: Add generate_dataset to python docker entrypoint
+  ([#667](https://github.com/tinaudio/synth-setter/pull/667),
+  [`c759aed`](https://github.com/tinaudio/synth-setter/commit/c759aed92351f789a206cb5b18e2505935721c24))
+
+* feat(docker): swap ENTRYPOINT to docker_entrypoint.py and de-override CI
+
+Hooks up the click-based Python entrypoint shipped in #645 as the image's live ENTRYPOINT and
+  retires the bash entrypoint + BATS suite. Workflows that previously bypassed the entrypoint via
+  `--entrypoint bash` now go through the real ENTRYPOINT (`generate_dataset` / `passthrough`).
+
+- docker/ubuntu22_04/Dockerfile: ENTRYPOINT = ["python", "/usr/local/bin/entrypoint.py"] - Delete
+  scripts/docker_entrypoint.sh, tests/test_entrypoint.bats, .github/workflows/bats-tests.yml. -
+  pipeline/entrypoints/generate_dataset.py: wrap the generate_vst_dataset.py subprocess with
+  run-linux-vst-headless.sh at the audio-rendering boundary so the click CLI stays X11-agnostic and
+  idle/passthrough don't pay the Xvfb startup cost. - Workflows: - dataset-generation.yml: split the
+  old `--entrypoint bash -c` block into a `passthrough bash -c` bootstrap step (git safe.directory +
+  plugin symlink + materialize_spec) and a `generate_dataset --spec` dispatch step through the
+  default ENTRYPOINT. CONFIG_PATH is forwarded via `-e` instead of being spliced into the shell
+  command text (removes a quoting hazard flagged on #645). - docker-build-validation.yml: convert
+  the two smoke-test invocations from `--entrypoint bash -c` to `passthrough ...`. -
+  spec-materialization.yml, flush-investigation.yml: same treatment. - test-dataset-generation.yml:
+  drop `-e MODE=passthrough` and replace with the positional `passthrough` subcommand; drop the
+  `scripts/docker_entrypoint.sh` trigger path. - Docs: scripts/README.md, docs/reference/docker.md,
+  docs/reference/docker-spec.md, docs/doc-map.yaml, docs/design/data-pipeline-implementation-plan.md
+  all drop the "bash live, python planned" framing, drop MODE/DATASET_CONFIG/
+  RUN_METADATA_DIR/R2_BUCKET env-var references, and describe the click CLI as the live ENTRYPOINT.
+  .env.example drops the same vars from the Docker runtime block.
+
+Also picks up three unresolved #645 review carryovers: - Module docstring in
+  scripts/docker_entrypoint.py said render_eval/train raise NotImplementedError; they raise
+  click.ClickException — updated. - docs/reference/docker-spec.md R2-bucket paragraph updated to
+  reflect the spec-driven flow (bucket lives in DatasetPipelineSpec.r2_bucket). - The
+  command-injection/quoting hazard around `$CONFIG_PATH` in dataset-generation.yml is eliminated
+  naturally by removing the nested bash -c expansion.
+
+Tests: make test → 182 passed, 2 skipped; `make format` clean. End-to-end smoke test against the new
+  ENTRYPOINT will exercise the built image once this PR's workflow run lands.
+
+Closes #647 · Part of #265
+
+* fix(docker): bake PYTHONPATH into image so default ENTRYPOINT finds pipeline
+
+pipeline is excluded from find_packages in setup.py, so the editable install doesn't expose it.
+  Running python /usr/local/bin/entrypoint.py only puts /usr/local/bin on sys.path, not the repo
+  root — so 'from pipeline.entrypoints.generate_dataset import run' fails with ModuleNotFoundError
+  at container start.
+
+The old bash entrypoint path worked because dataset-generation.yml exported
+  PYTHONPATH=/home/build/synth-setter before invoking the Python entrypoint. Migrating to the
+  default ENTRYPOINT dropped that export; bake it into the image instead so every caller gets the
+  same import surface without having to remember it.
+
+Refs #647
+
+* fix(packaging): include pipeline in editable install
+
+find_packages() previously excluded pipeline/ on the grounds that it has its own __init__.py and
+  setuptools was otherwise bundling it into an installed distribution. That was defensive against a
+  PyPI-publication scenario this repo doesn't have (setup.py has placeholder name/url/author and
+  there's no release workflow). The cost of the exclusion is that anything trying to import pipeline
+  without CWD on sys.path has to hand-roll a PYTHONPATH — which is why the old dataset-generation
+  workflow did 'export PYTHONPATH=/home/build/synth-setter' before every Python invocation.
+
+With the Dockerfile now invoking the entrypoint by absolute path (python
+  /usr/local/bin/entrypoint.py), that PYTHONPATH hack would need to move into the image (ENV
+  PYTHONPATH=...). Dropping the exclude is strictly simpler: 'uv pip install -e .' now exposes
+  pipeline through the venv the same way it exposes src, and the absolute-path entrypoint call just
+  works.
+
+Follow-ups if this repo ever does get published: - re-scope the exclude then, or switch to an
+  explicit include=['src*', 'pipeline*'] - the pre-existing tests.* inclusion in the installed
+  distribution is a separate hygiene issue, left untouched here
+
+Reverts the 719c5d6 ENV PYTHONPATH workaround.
+
+* ci: pass PYTHONPATH to docker runs until dev-snapshot is rebuilt
+
+The dev-snapshot image on Docker Hub was built against setup.py's old
+  find_packages(exclude=['pipeline', 'pipeline.*']) surface. Its editable install has a strict-mode
+  PEP 660 finder with a static MAPPING dict that lists only {configs, src, tests} — no pipeline.
+  Bind-mounting the PR's updated setup.py doesn't re-run the finder's installer, so 'from
+  pipeline.entrypoints.generate_dataset import run' fails at import time in every docker run that
+  goes through the click ENTRYPOINT.
+
+The setup.py fix in 8b45db7 is durable but only takes effect once the image is rebuilt and
+  re-pushed. Until then, override sys.path at runtime via -e PYTHONPATH — the same trick the old
+  workflow used before #645. Harmless once the image is fresh.
+
+Added to every docker run in: - dataset-generation.yml (bootstrap + generate) -
+  spec-materialization.yml (materialize) - flush-investigation.yml (notebook run) -
+  test-dataset-generation.yml (shard download + validate) - docker-build-validation.yml (both smoke
+  tests)
+
+Follow-up: once docker-build-validation pushes a fresh dev-snapshot on main, strip these PYTHONPATH
+  overrides in a separate PR.
+
+
 ## v0.4.0 (2026-04-21)
 
 ### Documentation
