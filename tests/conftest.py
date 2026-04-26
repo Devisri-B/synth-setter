@@ -9,6 +9,7 @@ from hydra.core.global_hydra import GlobalHydra
 from omegaconf import DictConfig, open_dict
 
 from src.utils.utils import register_resolvers
+from tests._baseline_worktree import worktree_for_ref  # noqa: F401 — pytest fixture re-export
 
 # Register custom OmegaConf resolvers (mul, div) needed to parse Hydra configs.
 # This import pulls in torch/lightning transitively via src.utils.utils, but every
@@ -134,3 +135,18 @@ def cfg_eval(cfg_eval_global: DictConfig, tmp_path: Path) -> DictConfig:
     yield cfg
 
     GlobalHydra.instance().clear()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register custom CLI options for the test suite."""
+    parser.addoption(
+        "--compare-baseline-configs-keep-yaml-dir",
+        action="store",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory to capture resolved Hydra YAMLs into. When set, the "
+            "python-shim harness writes <test-id>__<role>.yaml into DIR "
+            "instead of pytest's tmp_path so the files survive between runs."
+        ),
+    )
