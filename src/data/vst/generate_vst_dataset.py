@@ -67,12 +67,30 @@ def generate_sample(
     min_loudness: float,
     param_spec: ParamSpec,
     preset_path: str,
+    fixed_synth_params: dict[str, float] | None = None,
+    fixed_note_params: dict[str, int | tuple[float, float]] | None = None,
 ) -> VSTDataSample:
-    while True:
-        logger.debug("sampling params")
-        synth_params, note_params = param_spec.sample()
+    """Render a single VST sample.
 
-        logger.debug("sampling note")
+    When ``fixed_synth_params`` and/or ``fixed_note_params`` are supplied, they take
+    precedence over the values drawn from ``param_spec.sample()`` for deterministic
+    rendering. When BOTH are supplied, render inputs are fully fixed — the function
+    renders once and raises ``ValueError`` on loudness fail rather than retrying
+    against an unchanged input. When only one is supplied, the other is re-sampled
+    each retry and the loop remains meaningful.
+    """
+    fully_fixed = fixed_synth_params is not None and fixed_note_params is not None
+    while True:
+        if fixed_synth_params is None or fixed_note_params is None:
+            logger.debug("sampling params")
+            sampled_synth, sampled_note = param_spec.sample()
+            synth_params = (
+                fixed_synth_params if fixed_synth_params is not None else sampled_synth
+            )
+            note_params = fixed_note_params if fixed_note_params is not None else sampled_note
+        else:
+            synth_params = fixed_synth_params
+            note_params = fixed_note_params
 
         output = render_params(
             plugin_path,
@@ -90,6 +108,12 @@ def generate_sample(
         loudness = meter.integrated_loudness(output.T)
         logger.debug(f"loudness: {loudness}")
         if loudness < min_loudness:
+            if fully_fixed:
+                raise ValueError(
+                    f"fully-fixed render produced loudness {loudness:.2f} dB below "
+                    f"min_loudness {min_loudness:.2f} dB; retrying is futile because "
+                    f"render inputs are deterministic. Provide a louder patch."
+                )
             logger.debug("loudness too low, skipping")
             continue
 
@@ -222,6 +246,8 @@ def make_dataset(
     min_loudness: float,
     param_spec: ParamSpec,
     sample_batch_size: int,
+    fixed_synth_params_list: list[dict[str, float]] | None = None,
+    fixed_note_params_list: list[dict[str, int | tuple[float, float]]] | None = None,
 ) -> None:
 
     audio_dataset, mel_dataset, param_dataset, start_idx = (
@@ -235,6 +261,18 @@ def make_dataset(
         )
     )
 
+    expected_fixed_len = num_samples - start_idx
+    for name, lst in [
+        ("fixed_synth_params_list", fixed_synth_params_list),
+        ("fixed_note_params_list", fixed_note_params_list),
+    ]:
+        if lst is not None and len(lst) < expected_fixed_len:
+            raise ValueError(
+                f"{name} has length {len(lst)}, expected at least "
+                f"num_samples - start_idx = {expected_fixed_len} "
+                f"(num_samples={num_samples}, start_idx={start_idx})"
+            )
+
     audio_dataset.attrs["velocity"] = velocity
     audio_dataset.attrs["signal_duration_seconds"] = signal_duration_seconds
     audio_dataset.attrs["sample_rate"] = sample_rate
@@ -246,6 +284,7 @@ def make_dataset(
 
     for i in trange(start_idx, num_samples):
         logger.info(f"Making sample {i}")
+        fixed_idx = i - start_idx
         sample = generate_sample(
             plugin_path,
             velocity=velocity,
@@ -255,6 +294,16 @@ def make_dataset(
             min_loudness=min_loudness,
             param_spec=param_spec,
             preset_path=preset_path,
+            fixed_synth_params=(
+                fixed_synth_params_list[fixed_idx]
+                if fixed_synth_params_list is not None
+                else None
+            ),
+            fixed_note_params=(
+                fixed_note_params_list[fixed_idx]
+                if fixed_note_params_list is not None
+                else None
+            ),
         )
 
         sample_batch.append(sample)
