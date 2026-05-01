@@ -1,6 +1,105 @@
 # CHANGELOG
 
 
+## v0.7.3 (2026-05-01)
+
+### Internal-Feat
+
+- **pipeline**: Renderer-version contract end-to-end + rclone-native upload bounds
+  ([#740](https://github.com/tinaudio/synth-setter/pull/740),
+  [`86a46d2`](https://github.com/tinaudio/synth-setter/commit/86a46d2f71c151ec8445e1b84dc2c3e4cf0af0c4))
+
+* internal-feat(pipeline): pin renderer_version to SURGE_XT_RENDERER_VERSION; expose
+  extract_renderer_version
+
+`materialize_spec` previously extracted `renderer_version` from the VST3 plugin bundle at
+  materialization time, which required loading the plugin via `pedalboard.VST3Plugin` when neither
+  `Contents/moduleinfo.json` nor `Contents/Info.plist` was present — and that codepath needs an X
+  display. That blocks any caller that wants to materialize a spec without an X stack (e.g. the
+  SkyPilot launcher, which runs on a GHA runner / dev laptop and never loads the plugin itself).
+
+Pin `renderer_version` to a single source of truth, the `SURGE_XT_RENDERER_VERSION = "1.3.4"`
+  constant in this module, kept in lockstep with the dev-snapshot image's `SURGE_GIT_REF`.
+  `materialize_spec` now sets the pin directly and doesn't touch the plugin bundle.
+
+Keep `extract_renderer_version` as a public function — same static-metadata + pedalboard-fallback
+  shape — so the worker side can call it against the actual plugin and verify the pin matches
+  reality before rendering. The worker-side cross-check is the next commit; the rclone-native upload
+  bounds are the one after.
+
+Refs #534
+
+* internal-feat(pipeline): worker-side renderer_version cross-check in generate_dataset.run
+
+The launcher pins `renderer_version` to `SURGE_XT_RENDERER_VERSION` blindly (its code path stays
+  interpreter-only). The worker is where pedalboard is available, so the worker is where the pin
+  gets verified against reality.
+
+`run()` now calls `extract_renderer_version` against `spec.plugin_path` before any rclone or
+  subprocess work and raises `RuntimeError` if the running plugin disagrees with the spec. The error
+  message points at the two valid fixes (rebuild the image against the matching `SURGE_GIT_REF` or
+  bump the constant), so failures are actionable rather than mysterious. On match, a single
+  `renderer_version OK: …` info log records the confirmed pairing for forensics.
+
+Test fixture: tests/pipeline/fixtures/TestPlugin.vst3 (already on `main`) has
+  `Contents/moduleinfo.json` reporting Version="1.0.0-test". Updated `_base_spec_kwargs` to use that
+  fixture + that version so the spec/plugin pair matches by default; new test asserts mismatch
+  raises before any upload happens.
+
+* internal-fix(pipeline): rclone-native upload bounds + 'rclone returned cleanly' sentinel
+
+Two related observability fixes for the worker upload path:
+
+1. `_rclone_copy` was running `rclone copy --checksum src dst` with no timeouts and no retries — a
+  stuck TCP connect or a slow PUT could hold the worker indefinitely. Switch to rclone's own bounds:
+  --contimeout=30s bound TCP connect phase --timeout=300s bound any single HTTP request --retries=3
+  retry the whole copy on transient failure -vv emit per-request debug log so a failure leaves
+  actionable evidence in the worker stdout Letting rclone enforce these (vs. wrapping
+  `subprocess.run(..., timeout=N)` in Python) preserves the postcondition that a non-zero exit means
+  the upload genuinely failed, instead of "we waited N seconds and gave up".
+
+2. After `subprocess.check_call` returns from a successful rclone, log a single `rclone returned
+  cleanly: <src> -> <dst>` sentinel. Distinct string so CI logs can be grepped to tell at a glance
+  whether the rclone subprocess actually exited vs. hanging post-upload (the bug-#2 hang shape from
+  #735, now believed gone but worth keeping the canary).
+
+Adds matching boundary logs around the upload path (`spec written:`, `spec uploaded ->`, `rendering
+  shard …`, `shard rendered: … (N bytes)`, `shard uploaded: …`) so a `tail_logs(follow=False)` dump
+  pinpoints which step a hung run got to.
+
+Refs #534 Refs #735
+
+* refactor: move extract_renderer_version to src.data.vst.core
+
+The extractor reads VST3 plugin bundle metadata — that's a VST utility, not a spec-schema concern.
+  Move it next to the other VST helpers (`load_plugin`, `load_preset`, `render_params`) in
+  `src/data/vst/core.py` and update the worker-side caller in
+  `pipeline.entrypoints.generate_dataset` to import from the new location.
+
+`SURGE_XT_RENDERER_VERSION` stays in `pipeline.schemas.spec` because it is a spec-construction
+  constant (consumed by `materialize_spec`); only the extractor moves. Tests follow the source:
+  `TestExtractRendererVersion` moves from `tests/pipeline/test_schemas/test_spec.py` to a new
+  `tests/data/vst/test_core.py` (matching the existing
+  `tests/data/vst/{test_generate_vst_dataset,test_preset_*}.py` layout).
+
+No behavior change. The function signature and error contract are identical; tests are byte-for-byte
+  the same as their previous location, just imported from the new path.
+
+---------
+
+Co-authored-by: Your Name <you@example.com>
+
+### Revert
+
+- "build(deps): migrate lightning to pytorch_lightning"
+  ([#744](https://github.com/tinaudio/synth-setter/pull/744),
+  [`c757a7a`](https://github.com/tinaudio/synth-setter/commit/c757a7a49f63eb7d93f396f3269efdbcaddf73e4))
+
+This reverts commit 60fd65cebaab6a1d76caa82a345b17a5474d5beb.
+
+Co-authored-by: Your Name <you@example.com>
+
+
 ## v0.7.2 (2026-05-01)
 
 ### Bug Fixes
