@@ -1,6 +1,43 @@
 # CHANGELOG
 
 
+## v0.7.2 (2026-05-01)
+
+### Bug Fixes
+
+- **ci**: Drop `passthrough` from remaining docker run invocations after #721
+  ([#742](https://github.com/tinaudio/synth-setter/pull/742),
+  [`7ae7401`](https://github.com/tinaudio/synth-setter/commit/7ae7401f48eade9a3273ddf37519256c91dc6e0a))
+
+* fix(ci): drop `passthrough` from remaining docker run invocations after #721 dropped ENTRYPOINT
+
+PR #727 already dropped `passthrough` from `docker-build-validation.yml` and
+  `spec-materialization.yml`, but `dataset-generation.yml` and the `validate-shard` job in
+  `test-dataset-generation.yml` were missed and fail with `exec: "passthrough": executable file not
+  found in $PATH` against the rebuilt `dev-snapshot` image.
+
+Image now has no ENTRYPOINT and `CMD=["/bin/bash"]`, so trailing argv is exec'd directly:
+
+- `passthrough bash -c '…'` → `bash -c '…'` - `passthrough rclone copy …` → `rclone copy …` -
+  `passthrough python3 -m …` → `python3 -m …` - `generate_dataset --spec …` → `python
+  /usr/local/bin/entrypoint.py generate_dataset --spec …` (matches
+  `configs/compute/runpod-template.yaml` from #721)
+
+`flush-investigation.yml` still uses `passthrough` but is slated for deletion, so leave it
+  untouched.
+
+Closes #726
+
+* fix(ci): drop `passthrough` from test-vst-slow.yml after #721 dropped ENTRYPOINT
+
+Same pattern as the rest of #726: `docker run img passthrough bash -c '…'` fails with `exec:
+  "passthrough": executable file not found in $PATH` against the rebuilt `dev-snapshot` image (no
+  ENTRYPOINT, `CMD=["/bin/bash"]`). Drop the `passthrough` prefix so the trailing `bash -c '…'` is
+  exec'd directly.
+
+Refs #726
+
+
 ## v0.7.1 (2026-05-01)
 
 ### Bug Fixes
