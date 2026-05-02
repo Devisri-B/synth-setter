@@ -486,7 +486,7 @@ class TestMainCli:
 
         result = _invoke(config_yaml, template_yaml, env_file)
         assert result.exit_code != 0
-        assert "non-SUCCEEDED" in result.output
+        # Aggregate fan-out failure message names every failed rank with its rc.
         assert "rc=100" in result.output
         mock_sky.down.assert_called_once()
 
@@ -501,7 +501,10 @@ class TestMainCli:
         local_spec_dir: Path,
         mock_sky: MagicMock,
     ) -> None:
-        """If sky.launch yields no job_id the launcher aborts before tailing/teardown."""
+        """If sky.launch yields no job_id the launcher aborts; teardown is best-effort and
+        idempotent on a never-provisioned cluster name (sky.down on a missing cluster is a no-op),
+        so it still runs in the finally block to make multi-worker partial-failure cleanup
+        uniform."""
         responses = {
             "launch-req": (None, MagicMock()),
         }
@@ -511,7 +514,6 @@ class TestMainCli:
         assert result.exit_code != 0
         assert "no job_id" in result.output.lower()
         mock_sky.tail_logs.assert_not_called()
-        mock_sky.down.assert_not_called()
 
     def test_teardown_runs_when_tail_logs_raises(
         self,
@@ -556,3 +558,290 @@ class TestMainCli:
         assert spec_files[0].read_text(), (
             "local spec file should still be on disk for artifact upload"
         )
+
+
+class TestNumWorkersFanOut:
+    """`--num-workers N>1` fans out N independent single-node SkyPilot clusters.
+
+    RunPod's backend doesn't support num_nodes>1, so the launcher synthesizes multi-worker
+    partitioning by launching N clusters in parallel and injecting SYNTH_SETTER_WORKER_RANK /
+    SYNTH_SETTER_NUM_WORKERS per cluster. Each cluster downloads the same materialized spec;
+    pipeline.partitioning.get_my_shards slices each worker's shard ownership.
+    """
+
+    @staticmethod
+    def _setup_n_workers_mock(
+        mock_sky: MagicMock,
+        n: int,
+        *,
+        tail_rcs_by_cluster: dict[str, int] | None = None,
+        base_cluster_name: str = "smoke-job-1",
+    ) -> dict[str, MagicMock]:
+        """Configure `mock_sky` for an N-cluster run with deterministic per-cluster routing.
+
+        Returns a ``cluster_name -> Task`` dict keyed by the cluster name the launcher will
+        request, so tests can inspect each rank's ``update_envs`` call without depending on
+        ThreadPoolExecutor scheduling order. ``tail_logs`` and ``launch`` route by their
+        ``cluster_name`` kwarg (not by call order), so an rc=100 for ``smoke-job-1-r1``
+        deterministically attaches to rank 1 regardless of which thread ran first.
+        """
+        rcs = tail_rcs_by_cluster if tail_rcs_by_cluster is not None else {}
+        cluster_names = [f"{base_cluster_name}-r{i}" for i in range(n)]
+        tasks = {name: MagicMock(name=f"task-{name}") for name in cluster_names}
+        # `cluster_name` isn't a Task.from_yaml arg, so route Tasks by call order. The
+        # launcher creates exactly one Task per rank inside _launch_and_tail and immediately
+        # update_envs's it with the cluster name in the message — assertions key off the
+        # cluster_name in the env, not the Task identity, so call order doesn't matter here.
+        mock_sky.Task.from_yaml.side_effect = list(tasks.values())
+
+        # Route launch + down + stream_and_get + tail_logs by cluster_name kwarg, not order.
+        launch_reqs = {name: f"launch-{name}" for name in cluster_names}
+        down_reqs = {name: f"down-{name}" for name in cluster_names}
+        mock_sky.launch.side_effect = lambda task, **kw: launch_reqs[kw["cluster_name"]]
+        mock_sky.down.side_effect = lambda name: down_reqs[name]
+
+        stream_responses: dict[str, object] = {
+            launch_reqs[name]: (i + 1, MagicMock()) for i, name in enumerate(cluster_names)
+        }
+        stream_responses.update({req: None for req in down_reqs.values()})
+        mock_sky.stream_and_get.side_effect = lambda req: stream_responses[req]
+
+        mock_sky.tail_logs.side_effect = lambda **kw: rcs.get(kw["cluster_name"], 0)
+        return tasks
+
+    def test_three_workers_launches_three_clusters(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """`--num-workers 3` provisions exactly 3 clusters."""
+        self._setup_n_workers_mock(mock_sky, n=3)
+
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "3",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert mock_sky.launch.call_count == 3
+        assert mock_sky.tail_logs.call_count == 3
+        assert mock_sky.down.call_count == 3
+
+    def test_three_workers_use_rank_suffixed_cluster_names(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """N>1 launches use `<base>-r{i}` cluster names so the per-rank pods are distinguishable in
+        SkyPilot's UI / dashboards."""
+        self._setup_n_workers_mock(mock_sky, n=3)
+
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "3",
+        )
+
+        assert result.exit_code == 0, result.output
+        launch_cluster_names = sorted(
+            call.kwargs["cluster_name"] for call in mock_sky.launch.call_args_list
+        )
+        assert launch_cluster_names == ["smoke-job-1-r0", "smoke-job-1-r1", "smoke-job-1-r2"]
+
+    def test_one_worker_keeps_unsuffixed_cluster_name(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """`--num-workers 1` (default) keeps the unsuffixed cluster name for backward-compat with
+        debug workflows / dashboards that key off it."""
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_sky.launch.assert_called_once()
+        assert mock_sky.launch.call_args.kwargs["cluster_name"] == "smoke-job-1"
+
+    def test_three_workers_inject_distinct_rank_world_per_cluster(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """Each rank's task gets ``SYNTH_SETTER_WORKER_RANK=<i>`` and
+        ``SYNTH_SETTER_NUM_WORKERS=<N>`` injected.
+
+        Workers read these via ``read_rank_world_from_env`` and partition the
+        shared spec via ``get_my_shards``.
+        """
+        tasks = self._setup_n_workers_mock(mock_sky, n=3)
+
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "3",
+        )
+
+        assert result.exit_code == 0, result.output
+        forwarded = [t.update_envs.call_args.args[0] for t in tasks.values()]
+        ranks = sorted(env["SYNTH_SETTER_WORKER_RANK"] for env in forwarded)
+        assert ranks == ["0", "1", "2"]
+        for env in forwarded:
+            assert env["SYNTH_SETTER_NUM_WORKERS"] == "3"
+            assert env["RCLONE_CONFIG_R2_ACCESS_KEY_ID"] == "key"
+            assert env["WORKER_SPEC_URI"] == (
+                "r2://intermediate-data/skypilot-launcher-specs/smoke-job-1.json"
+            )
+
+    def test_three_workers_upload_spec_only_once(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Spec is materialized + uploaded to R2 once and shared across all ranks (single
+        ``r2_prefix`` so the partition is one logical dataset, not three)."""
+        self._setup_n_workers_mock(mock_sky, n=3)
+        rclone_invocations: list[list[str]] = []
+        monkeypatch.setattr(
+            "pipeline.entrypoints.skypilot_launch_smoke.subprocess.check_call",
+            lambda args: rclone_invocations.append(args),
+        )
+
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "3",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(rclone_invocations) == 1
+        assert rclone_invocations[0][-1] == (
+            "r2:intermediate-data/skypilot-launcher-specs/smoke-job-1.json"
+        )
+
+    def test_one_worker_failure_among_three_fails_launcher_after_full_teardown(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """If any rank's tail_logs returns non-zero, the launcher exits non-zero, but every cluster
+        (success or fail) gets torn down — partial-failure cleanup must be uniform."""
+        self._setup_n_workers_mock(mock_sky, n=3, tail_rcs_by_cluster={"smoke-job-1-r1": 100})
+
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "3",
+        )
+
+        assert result.exit_code != 0
+        assert "rc=100" in result.output
+        assert "smoke-job-1-r1" in result.output
+        assert mock_sky.down.call_count == 3
+
+    def test_worker_git_ref_forwarded_to_every_rank(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`WORKER_GIT_REF` from process env reaches every rank's task via update_envs.
+
+        The pod's `run:` block reads this and `git fetch+checkout`s before invoking
+        generate_dataset, so the worker runs the dispatcher's source instead of the baked image's
+        stale checkout.
+        """
+        tasks = self._setup_n_workers_mock(mock_sky, n=3)
+        monkeypatch.setenv("WORKER_GIT_REF", "abc1234deadbeef")
+
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "3",
+        )
+
+        assert result.exit_code == 0, result.output
+        forwarded = [t.update_envs.call_args.args[0] for t in tasks.values()]
+        for env in forwarded:
+            assert env["WORKER_GIT_REF"] == "abc1234deadbeef"
+
+    def test_zero_or_negative_num_workers_rejected(
+        self,
+        config_yaml: Path,
+        template_yaml: Path,
+        env_file: Path,
+        patch_materialize_io: None,
+        local_spec_dir: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """`--num-workers 0` (or negative) is a CLI usage error — never reach sky.*."""
+        result = _invoke(
+            config_yaml,
+            template_yaml,
+            env_file,
+            "--cluster-name",
+            "smoke-job-1",
+            "--num-workers",
+            "0",
+        )
+        assert result.exit_code != 0
+        assert "must be >= 1" in result.output
+        mock_sky.launch.assert_not_called()
