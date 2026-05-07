@@ -9,10 +9,12 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import pandas as pd
 import rootutils
@@ -126,6 +128,58 @@ _COMPUTE_AUDIO_METRICS_SCRIPT = _REPO_ROOT / "scripts" / "compute_audio_metrics.
 SILENCE_PEAK_THRESHOLD = 1e-4
 
 _METRIC_COLUMNS: frozenset[str] = frozenset({"mss", "wmfcc", "sot", "rms"})
+
+
+# ----- Test seams ---------------------------------------------------------------------
+# Narrow dependency-injection points so tests can substitute fakes that capture state
+# instead of monkey-patching module-level functions. Defaults preserve production behavior;
+# CLI surface is unchanged. Each seam is keyword-only at the call sites that accept it.
+# Refs #844.
+
+# Returns whatever stdlib ``subprocess.run`` / ``subprocess.check_call`` return; production
+# callers either ignore the result or read ``.returncode`` from a ``CompletedProcess``.
+SubprocessRunner = Callable[..., object]
+
+
+class AudioStreamProtocol(Protocol):
+    """Structural surface ``play_audio`` needs from an entered audio-output stream."""
+
+    def write(self, buffer: np.ndarray, sample_rate: int) -> object: ...
+
+
+class MidiMessageProtocol(Protocol):
+    """Structural surface ``midi_listener`` needs from a polled mido message."""
+
+    type: str
+
+    def bytes(self) -> list[int]: ...
+
+
+class MidiPortProtocol(Protocol):
+    """Structural surface ``midi_listener`` needs from an entered mido input port."""
+
+    def poll(self) -> MidiMessageProtocol | None: ...
+
+
+PortOpener = Callable[[str], AbstractContextManager[MidiPortProtocol]]
+
+# Factory returning an audio-output stream context manager — entered by ``play_audio`` via
+# ``with factory() as stream``. Production binds ``AudioStream.default_output_device_name``
+# lazily so test factories never trigger a real-device probe.
+AudioStreamFactory = Callable[[], AbstractContextManager[AudioStreamProtocol]]
+
+
+def _default_audio_stream_factory() -> AbstractContextManager[AudioStreamProtocol]:
+    """Build the production ``AudioStream`` used by ``play_audio``.
+
+    Defined as a separate helper so the default-device lookup happens only when the seam is left at
+    its default — fake factories used in tests never trigger PortAudio device probing.
+    """
+    return AudioStream(  # pyright: ignore[reportReturnType]
+        output_device_name=AudioStream.default_output_device_name,
+        sample_rate=PLAYBACK_SAMPLE_RATE,
+        buffer_size=BUFFER_SIZE,
+    )
 
 
 @dataclass(frozen=True)
@@ -347,6 +401,8 @@ def play_audio(
     plugin: VST3Plugin,
     stop_event: threading.Event,
     midi_queue: "queue.Queue[tuple[list[int], float]] | None",
+    *,
+    audio_stream_factory: AudioStreamFactory | None = None,
 ) -> None:
     """Stream Surge XT output to the audio device, processing any pending MIDI messages.
 
@@ -355,17 +411,20 @@ def play_audio(
     each iteration so the plugin sees incoming notes/CCs from the MIDI listener thread.
     Resamples to ``PLAYBACK_SAMPLE_RATE`` if it differs from ``SAMPLE_RATE`` so the output
     device gets a rate it supports.
+
+    ``audio_stream_factory`` exists for test injection (#844). ``None`` (the default)
+    builds the real pedalboard ``AudioStream`` at call time so legacy module-level
+    monkeypatches of ``AudioStream`` keep working.
     """
     needs_resample = SAMPLE_RATE != PLAYBACK_SAMPLE_RATE
     stream_resampler = (
         StreamResampler(SAMPLE_RATE, PLAYBACK_SAMPLE_RATE, CHANNELS) if needs_resample else None
     )
     buffer_duration_seconds = BUFFER_SIZE / SAMPLE_RATE
-    with AudioStream(
-        output_device_name=AudioStream.default_output_device_name,
-        sample_rate=PLAYBACK_SAMPLE_RATE,
-        buffer_size=BUFFER_SIZE,
-    ) as stream:
+    factory = (
+        audio_stream_factory if audio_stream_factory is not None else _default_audio_stream_factory
+    )
+    with factory() as stream:
         while not stop_event.is_set():
             messages: list[tuple[list[int], float]] = []
             if midi_queue is not None:
@@ -396,6 +455,8 @@ def midi_listener(
     port_name: str,
     midi_queue: "queue.Queue[tuple[list[int], float]]",
     stop_event: threading.Event,
+    *,
+    port_opener: PortOpener | None = None,
 ) -> None:
     """Listen on a MIDI input port and push ``(list[int], float)`` tuples onto ``midi_queue``.
 
@@ -411,10 +472,15 @@ def midi_listener(
     ``_MIDI_POLL_INTERVAL_SECONDS`` and exits cleanly when ``main`` signals shutdown
     — otherwise the queue would keep growing after the audio thread stops (e.g. while
     ``main`` waits at the post-editor "press any key" prompt).
+
+    ``port_opener`` exists for test injection (#844). ``None`` (the default) resolves to
+    ``mido.open_input`` at call time so legacy ``monkeypatch.setattr(surge_xt_interactive.mido,
+    "open_input", ...)`` tests keep working until they migrate to direct injection.
     """
     logger.info("Listening on MIDI port: %s", port_name)
+    opener = port_opener if port_opener is not None else mido.open_input  # pyright: ignore[reportAttributeAccessIssue]
     try:
-        with mido.open_input(port_name) as port_handle:  # pyright: ignore[reportAttributeAccessIssue]
+        with opener(port_name) as port_handle:
             while not stop_event.is_set():
                 msg = port_handle.poll()
                 if msg is None:
@@ -579,6 +645,8 @@ def _run_predict(
     predict_file: Path,
     predictions_output_dir: Path,
     param_spec_name: str,
+    *,
+    subprocess_runner: SubprocessRunner | None = None,
 ) -> None:
     """Run model prediction via ``src/eval.py`` with ``mode=predict``.
 
@@ -586,9 +654,14 @@ def _run_predict(
     chdirs into its own output dir before the job starts; relative paths would otherwise resolve
     against the wrong cwd. ``model.net.d_out`` is overridden from ``len(param_specs[...])`` to
     satisfy the mandatory-override sentinel in ``configs/experiment/surge/test.yaml``.
+
+    ``subprocess_runner`` exists for test injection (#844). ``None`` (the default) resolves to
+    ``subprocess.check_call`` at call time so legacy ``monkeypatch.setattr(subprocess, ...)``
+    tests keep working until they migrate to direct injection.
     """
+    runner = subprocess_runner if subprocess_runner is not None else subprocess.check_call
     encoded_width = len(param_specs[param_spec_name])
-    subprocess.check_call(  # noqa: S603
+    runner(  # noqa: S603
         [
             sys.executable,
             str(_EVAL_SCRIPT),
@@ -637,6 +710,8 @@ def _render_predicted_audio(
     num_samples: int,
     param_spec_name: str,
     preset_path: str,
+    *,
+    subprocess_runner: SubprocessRunner | None = None,
 ) -> None:
     """Render audio for the predicted patches and validate per-sample outputs (file presence and
     non-silent WAVs).
@@ -669,8 +744,9 @@ def _render_predicted_audio(
         preset_path,
         "-t",
     ]
+    runner = subprocess_runner if subprocess_runner is not None else subprocess.run
     try:
-        subprocess.run(  # noqa: S603
+        runner(  # noqa: S603
             args,
             check=True,
             timeout=_VST_SUBPROCESS_TIMEOUT_SECONDS,
@@ -704,8 +780,17 @@ def _render_predicted_audio(
                 raise ValueError(f"{sample_dir.name}/{wav_name} is silent (peak={peak:.2e})")
 
 
-def _compute_and_validate_metrics(audio_dir: Path, metrics_dir: Path, num_samples: int) -> None:
+def _compute_and_validate_metrics(
+    audio_dir: Path,
+    metrics_dir: Path,
+    num_samples: int,
+    *,
+    subprocess_runner: SubprocessRunner | None = None,
+) -> None:
     """Compute MSS / wMFCC / SOT / RMS metrics on the rendered pairs and verify the CSV outputs.
+
+    ``subprocess_runner`` exists for test injection (#844). ``None`` (the default) resolves to
+    ``subprocess.check_call`` at call time so legacy module-level monkeypatches keep working.
 
     :raises FileNotFoundError: if either metrics CSV is missing.
     :raises ValueError: if a metrics CSV has unexpected shape or columns, or contains NaN/Inf.
@@ -716,7 +801,8 @@ def _compute_and_validate_metrics(audio_dir: Path, metrics_dir: Path, num_sample
         ),
         "metrics.csv": _MetricsFileSpec(rows=num_samples, columns=_METRIC_COLUMNS),
     }
-    subprocess.check_call(  # noqa: S603
+    runner = subprocess_runner if subprocess_runner is not None else subprocess.check_call
+    runner(  # noqa: S603
         [
             sys.executable,
             str(_COMPUTE_AUDIO_METRICS_SCRIPT),
@@ -741,6 +827,8 @@ def eval_patches(
     checkpoint_path: Path,
     param_spec_name: str,
     preset_path: str,
+    *,
+    subprocess_runner: SubprocessRunner | None = None,
 ) -> None:
     """Run model eval on captured patches end-to-end.
 
@@ -766,6 +854,10 @@ def eval_patches(
         the patches were captured.
     :param preset_path: Base preset to load when rendering predicted audio. Must match the preset
         used when the patches were captured.
+    :param subprocess_runner: Test seam (#844) — when set, forwarded to every subprocess-using
+        helper so a single fake records all three external invocations. ``None`` (the default)
+        preserves production behavior by letting each helper bind its own
+        ``subprocess.run``/``subprocess.check_call`` default.
     :raises FileNotFoundError: if ``checkpoint_path`` is missing, ``dataset_root_dir`` is not a
         directory, ``predict.h5`` is missing, or any expected pipeline output is absent.
     :raises ValueError: if predictions contain NaN/Inf, a rendered WAV is silent, or a metrics CSV
@@ -789,14 +881,27 @@ def eval_patches(
         shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    runner_kwargs: dict[str, SubprocessRunner] = (
+        {"subprocess_runner": subprocess_runner} if subprocess_runner is not None else {}
+    )
     _run_predict(
-        checkpoint_path, dataset_root_dir, predict_file, predictions_output_dir, param_spec_name
+        checkpoint_path,
+        dataset_root_dir,
+        predict_file,
+        predictions_output_dir,
+        param_spec_name,
+        **runner_kwargs,
     )
     _validate_predictions(predictions_output_dir, num_samples)
     _render_predicted_audio(
-        predictions_output_dir, audio_dir, num_samples, param_spec_name, preset_path
+        predictions_output_dir,
+        audio_dir,
+        num_samples,
+        param_spec_name,
+        preset_path,
+        **runner_kwargs,
     )
-    _compute_and_validate_metrics(audio_dir, metrics_dir, num_samples)
+    _compute_and_validate_metrics(audio_dir, metrics_dir, num_samples, **runner_kwargs)
 
 
 @click.command()
@@ -1063,6 +1168,9 @@ def main(
     )
 
 
+EvalRunner = Callable[[int, Path, Path, str, str], None]
+
+
 def _maybe_eval_captured_patches(
     patch_file_path: Path,
     output_dataset_dir_path: Path,
@@ -1070,6 +1178,8 @@ def _maybe_eval_captured_patches(
     checkpoint_path: Path | None,
     param_spec_name: str,
     preset_path: str,
+    *,
+    eval_runner: EvalRunner | None = None,
 ) -> None:
     """Replicate captured patches into the four eval-pipeline splits and run eval_patches if a
     checkpoint is provided; no-op otherwise.
@@ -1079,10 +1189,15 @@ def _maybe_eval_captured_patches(
     ``param_spec_name`` and ``preset_path`` are forwarded to ``eval_patches`` so the predict /
     render / metrics steps decode and re-render against the same spec + preset that were used
     when the patches were captured.
+
+    ``eval_runner`` exists for test injection (#844). ``None`` (the default) resolves to the
+    module-level :func:`eval_patches` at call time so legacy ``monkeypatch.setattr(module,
+    "eval_patches", ...)`` tests keep working until they migrate to direct injection.
     """
     if checkpoint_path is None:
         logger.info("No --checkpoint-path provided; skipping patch evaluation.")
         return
+    runner = eval_runner if eval_runner is not None else eval_patches
     sibling_paths = [
         output_dataset_dir_path / name for name in ("test.h5", "val.h5", "predict.h5")
     ]
@@ -1098,9 +1213,7 @@ def _maybe_eval_captured_patches(
             except OSError:
                 logger.exception("failed to roll back partial sibling copy at %s", created)
         raise
-    eval_patches(
-        num_patches, output_dataset_dir_path, checkpoint_path, param_spec_name, preset_path
-    )
+    runner(num_patches, output_dataset_dir_path, checkpoint_path, param_spec_name, preset_path)
 
 
 if __name__ == "__main__":
