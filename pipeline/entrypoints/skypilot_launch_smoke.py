@@ -1,7 +1,8 @@
-"""Launch the smoke `generate_dataset` run on RunPod or OCI via SkyPilot.
+"""Launch the smoke `generate_dataset` run on RunPod, OCI, or local kind via SkyPilot.
 
-Provider-neutral entrypoint: the same binary launches against either
-`configs/compute/runpod-template.yaml` or `configs/compute/oci-cpu-template.yaml`.
+Provider-neutral entrypoint: the same binary launches against
+`configs/compute/runpod-template.yaml`, `configs/compute/oci-cpu-template.yaml`,
+or `configs/compute/local-template.yaml` (kubernetes-via-`sky local up`).
 Materializes a spec, ships it via R2 (file_mounts blocked by #749), forwards
 worker env via `task.update_envs`, and `sky.launch`-es an unmanaged task. By
 default the launcher waits for `sky.launch` + `sky.stream_and_get` to return a
@@ -39,6 +40,8 @@ from pathlib import Path
 
 import click
 import sky
+import sky.check  # accessed conditionally on the kubernetes path; see provider == "local" branch in main()
+import yaml
 from dotenv import dotenv_values
 
 from pipeline.partitioning import NUM_WORKERS_ENV_VAR, WORKER_RANK_ENV_VAR
@@ -70,6 +73,19 @@ _WORKER_ENV_KEYS: tuple[str, ...] = (
     "RCLONE_CONFIG_R2_ENDPOINT",
     "WANDB_API_KEY",
     "WORKER_GIT_REF",
+)
+
+# rclone needs `type` + `provider` to construct the `r2:` remote, but those
+# values are constants for Cloudflare R2 — not secrets — so default them
+# rather than burdening every workflow / .env with two extra lines. An
+# explicit override (env or .env) wins.
+_R2_RCLONE_CONSTANTS: dict[str, str] = {
+    "RCLONE_CONFIG_R2_TYPE": "s3",
+    "RCLONE_CONFIG_R2_PROVIDER": "Cloudflare",
+}
+
+_CRED_BOOTSTRAP_SCRIPT = (
+    Path(__file__).resolve().parent.parent.parent / "scripts" / "skypilot_write_provider_creds.sh"
 )
 
 # sky.tail_logs(follow=True) rc: 0 = SUCCEEDED, 100 = non-SUCCEEDED terminal.
@@ -116,12 +132,117 @@ def resolve_worker_env(env_file: Path | None) -> dict[str, str]:
             resolved[key] = file_env[key]
         elif key in os.environ:
             resolved[key] = os.environ[key]
+
+    for key, default in _R2_RCLONE_CONSTANTS.items():
+        resolved.setdefault(key, default)
+
     git_ref = resolved.get("WORKER_GIT_REF", "")
     if git_ref and not _WORKER_GIT_REF_RE.match(git_ref):
         raise click.ClickException(
             f"WORKER_GIT_REF must be a 7-40 char hex git SHA, got {git_ref!r}"
         )
     return resolved
+
+
+_CLOUD_TO_PROVIDER: dict[str, str] = {
+    "runpod": "runpod",
+    "oci": "oci",
+    "kubernetes": "local",
+    "k8s": "local",  # SkyPilot accepts both
+}
+
+
+def _detect_provider(template_path: Path) -> str:
+    """Return the cred-bootstrap `--provider` flag for a Task YAML's first cloud.
+
+    Reads the YAML directly (rather than going through `sky.Task.from_yaml`) so
+    each rank's task instantiation isn't burdened with an extra detection load
+    and so test fixtures don't need an extra side_effect slot for a probe Task.
+    Handles both the flat `resources: { cloud: X }` shape (RunPod, kubernetes)
+    and the `resources: { any_of: [{ cloud: X }, ...] }` shape (OCI Flex).
+    """
+    with template_path.open(encoding="utf-8") as f:
+        doc = yaml.safe_load(f)
+    if not isinstance(doc, dict):
+        raise click.ClickException(
+            f"Could not detect cloud from {template_path}; "
+            "expected a YAML mapping with a `resources` key, got empty/non-mapping content."
+        )
+    resources = doc.get("resources") or {}
+    if not isinstance(resources, dict):
+        raise click.ClickException(
+            f"Could not detect cloud from {template_path}; expected `resources` to be a mapping."
+        )
+    cloud_value = resources.get("cloud")
+    if cloud_value is None:
+        any_of = resources.get("any_of") or []
+        if not isinstance(any_of, list):
+            raise click.ClickException(
+                f"Could not detect cloud from {template_path}; "
+                "expected `resources.any_of` to be a list."
+            )
+        if any_of:
+            first = any_of[0]
+            if not isinstance(first, dict):
+                raise click.ClickException(
+                    f"Could not detect cloud from {template_path}; "
+                    "expected `resources.any_of[0]` to be a mapping."
+                )
+            cloud_value = first.get("cloud")
+    if not isinstance(cloud_value, str):
+        raise click.ClickException(
+            f"Could not detect cloud from {template_path}; "
+            "expected resources.cloud (str) or resources.any_of[0].cloud (str)."
+        )
+    provider = _CLOUD_TO_PROVIDER.get(cloud_value.strip().lower())
+    if provider is None:
+        raise click.ClickException(
+            f"Unsupported cloud {cloud_value!r} in {template_path}; cred bootstrap "
+            "supports runpod, oci, and local (kubernetes) only"
+        )
+    return provider
+
+
+def _run_cred_bootstrap(*, provider: str, env_file_path: Path | None = None) -> None:
+    """Invoke `scripts/skypilot_write_provider_creds.sh` for `provider`.
+
+    The script writes cred files to disk and emits no stdout — captured anyway
+    via `subprocess.run(capture_output=True)` so even surprise output cannot
+    reach a caller's tee'd workflow log.
+
+    When `SKYPILOT_API_SERVER_ENDPOINT` is set the remote API server holds the
+    provider creds; the local cred-write is a no-op and this returns early.
+
+    The subprocess inherits `os.environ` merged with `env_file_path` values
+    (when provided) so a local-dev `.env` carrying provider creds bootstraps
+    cleanly without manual `export`.
+    """
+    if os.environ.get("SKYPILOT_API_SERVER_ENDPOINT"):
+        click.echo(
+            "SKYPILOT_API_SERVER_ENDPOINT is set; remote API server holds provider "
+            "creds, skipping local cred bootstrap",
+            err=True,
+        )
+        return
+
+    env = {**os.environ}
+    if env_file_path is not None and env_file_path.is_file():
+        env.update(load_worker_env(env_file_path))
+
+    try:
+        result = subprocess.run(  # noqa: S603 — controlled args, in-repo script
+            ["bash", str(_CRED_BOOTSTRAP_SCRIPT), "--provider", provider],  # noqa: S607 — bash on PATH
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise click.ClickException(
+            f"cred bootstrap failed (rc={exc.returncode}): {exc.stderr.strip()}"
+        ) from exc
+    if result.stderr:
+        click.echo(result.stderr, err=True)
 
 
 def upload_spec_to_r2(spec: DatasetPipelineSpec, cluster_name: str) -> str:
@@ -269,12 +390,26 @@ def main(
         )
 
     worker_env = resolve_worker_env(env_file_path)
-    if not worker_env:
+    # `_R2_RCLONE_CONSTANTS` defaults TYPE/PROVIDER, so an "empty" worker_env still has those.
+    # Check the actual secret keys to detect the unconfigured-creds case.
+    secret_keys = tuple(k for k in _WORKER_ENV_KEYS if k not in _R2_RCLONE_CONSTANTS)
+    if not any(k in worker_env for k in secret_keys):
         raise click.ClickException(
             "No worker env vars resolved. Set the rclone-R2 keys in process env "
             f"(e.g. via `docker run -e RCLONE_CONFIG_R2_*=...`) or populate {env_file_path}. "
-            f"Expected at least one of: {', '.join(_WORKER_ENV_KEYS)}."
+            f"Expected at least one of: {', '.join(secret_keys)}."
         )
+
+    # `upload_spec_to_r2` shells out to rclone, which inherits os.environ.
+    # `worker_env` already reflects the launcher's resolved precedence
+    # (env-file > process env, per `resolve_worker_env`), so write through to
+    # `os.environ` to make the rclone subprocess see the same effective
+    # values the launcher resolved — not whatever happened to be exported
+    # in the launcher process. CI sets these in the workflow `env:` block
+    # directly, so the assignment is a no-op there.
+    for key, value in worker_env.items():
+        if key.startswith("RCLONE_CONFIG_R2_"):
+            os.environ[key] = value
 
     config = load_dataset_config(config_path)
     config_id = dataset_config_id_from_path(config_path)
@@ -292,12 +427,32 @@ def main(
     local_spec_path.write_text(spec.model_dump_json(indent=2), encoding="utf-8")
     click.echo(f"Materialized spec to {local_spec_path}")
 
+    # Cred bootstrap is launcher-host scoped (writes ~/.cloudflare/, ~/.runpod/,
+    # ~/.oci/) and runs once per launcher invocation. Provider auto-detected
+    # from the template's `resources.cloud`. Subprocess inherits os.environ +
+    # any --env-file values; bootstrap script captures stdout (which it never
+    # emits anyway by design) so a tee'd caller workflow can't leak secrets.
+    #
+    # Runs BEFORE `upload_spec_to_r2` so a bootstrap failure (e.g. missing
+    # provider env) fails the launcher fast without polluting R2 with a spec
+    # that no worker will ever consume.
+    provider = _detect_provider(template_path)
+    _run_cred_bootstrap(provider=provider, env_file_path=env_file_path)
+
     # One spec upload, shared across all ranks. Spec is keyed by base cluster name (no -rN
     # suffix) so all workers in a fan-out group download from the same R2 object and see the
     # same r2_prefix — this is what makes the partition cohere as one logical dataset.
     spec_uri = upload_spec_to_r2(spec, base_cluster_name)
     click.echo(f"Spec uploaded to {spec_uri}")
     worker_env[_WORKER_SPEC_URI_ENV] = spec_uri
+
+    # Kubernetes-specific: SkyPilot 0.12 caches enabled-clouds in-process; a
+    # CLI `sky check` doesn't always populate the cache the SDK reads, and
+    # `sky.launch` raises NoCloudAccessError on a fresh runner. Calling
+    # `sky.check.check` in-process before launch is the documented workaround
+    # (test-skypilot-local.yml). RunPod/OCI source creds from disk on every launch.
+    if provider == "local":
+        sky.check.check(clouds=["kubernetes"], quiet=False)
 
     # Single-worker keeps the unsuffixed cluster name for backward compatibility with debug
     # workflows / CI dashboards that key off it; multi-worker uses -rN suffixes.
