@@ -1,6 +1,86 @@
 # CHANGELOG
 
 
+## v0.10.0 (2026-05-07)
+
+### Features
+
+- **skypilot**: Make detach (--no-tail) the default for skypilot_launch_smoke launcher
+  ([#824](https://github.com/tinaudio/synth-setter/pull/824),
+  [`784b79c`](https://github.com/tinaudio/synth-setter/commit/784b79c01fc3d045ff882c84d2a877ee98bf8a13))
+
+* feat(skypilot): make detach (--no-tail) the default for skypilot_launch_smoke launcher
+
+Add `--tail/--no-tail` to `pipeline/entrypoints/skypilot_launch_smoke.py`, defaulting to
+  `--no-tail`. The new default waits for `sky.launch` + `sky.stream_and_get` to return a `job_id`
+  per rank (i.e. through provisioning), prints the `sky logs` / `sky down` commands the operator can
+  run, then exits without tailing logs or tearing clusters down. The pre-existing
+  `idle_minutes_to_autostop=5, down=True` on `sky.launch` is the safety net for left-running
+  clusters.
+
+`--tail` preserves the old behavior end-to-end: tail logs per rank, aggregate return codes, tear
+  down all clusters in the `finally` block, raise ClickException on any rank failure.
+
+If a `--no-tail` `sky.launch` itself raises or yields no `job_id` (the cluster may be
+  half-provisioned), only that specific cluster is torn down so SkyPilot state doesn't accumulate
+  orphans; sibling clusters that launched cleanly are left running.
+
+Refactor: the shared launch+job_id step is extracted into a small closure (`_launch_get_job_id`),
+  and the two modes become separate small runners (`_run_workers_tail`, `_run_workers_detached`)
+  that consume that closure. The module docstring and the new Click `--tail/--no-tail` help text
+  document the new default.
+
+Closes #823
+
+* ci(skypilot): pass --tail in CI launcher invocations + sync doc-drift
+
+Three CI lanes invoke `pipeline.entrypoints.skypilot_launch_smoke` and rely on the launcher's exit
+  code reflecting worker success and on uniform finally-block teardown:
+
+- `.github/workflows/test-dataset-generation.yml` — `runpod`/`oci` matrix lane -
+  `.github/workflows/test-skypilot-debug.yml` — `launcher` and `launcher-docker` modes
+
+With the previous commit flipping the default to `--no-tail`, those lanes would silently exit 0 once
+  `job_id` is known (i.e. before the worker job finishes) and would not tear down clusters. Pass
+  `--tail` explicitly so CI semantics are unchanged.
+
+Also resolve docs flagged as drift by the doc-drift agent against this PR:
+
+- `docs/design/skypilot-compute-integration.md`: §8.1 "Launch mode" was an open question; now
+  resolved by `--tail/--no-tail`. Move it out of "Open Questions" into a new §4.1.1 Launch mode
+  subsection that points at the Click option for the live default. - `docs/doc-map.yaml`: drop the
+  stale `_wait_for_job` symbol reference and describe the new `_run_workers_tail` /
+  `_run_workers_detached` split.
+
+Refs #823
+
+* docs(skypilot): clarify launcher wording per PR #824 review
+
+Three Copilot nits on PR #824, all wording-only:
+
+- `--tail` Click help: replace "`sky.launch` to return a `job_id`" with "`sky.launch` +
+  `sky.stream_and_get` to return a `job_id`" (matches the module docstring). - `_run_workers`
+  docstring: same wording fix on the `tail=False` branch. - `_run_workers_tail` exception log:
+  rename "launch raised" to "launch or tail raised" since `fut.result()` may surface a
+  `sky.tail_logs` failure, not just a launch failure. The same message in `_run_workers_detached` is
+  left as-is — that path never tails.
+
+* docs(skypilot): clarify --no-tail teardown of half-provisioned clusters
+
+Address PR #824 Copilot review (commit 7f34480, 5 inline comments). The --no-tail prose previously
+  said the launcher exits "without tearing clusters down", but the implementation also tears down
+  half-provisioned clusters — both when sky.launch raises and when sky.stream_and_get yields no
+  job_id (raised as ClickException at line 392). Update the wording in all five spots so operators
+  aren't surprised when a failed launch leaves no orphan cluster behind.
+
+Updated surfaces: - skypilot_launch_smoke.py module docstring (comment 3192270033) -
+  --tail/--no-tail Click help text (comment 3192270054) - _run_workers docstring tail=False branch
+  (comment 3192270065) - _run_workers_detached docstring (comment 3192270088) -
+  docs/design/skypilot-compute-integration.md §4.1.1 (comment 3192270097)
+
+No code logic change — pure doc drift fix. tests/pipeline/ 193 passed.
+
+
 ## v0.9.0 (2026-05-07)
 
 ### Build System
