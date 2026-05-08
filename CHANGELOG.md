@@ -1,6 +1,180 @@
 # CHANGELOG
 
 
+## v0.14.0 (2026-05-08)
+
+### Documentation
+
+- Link param_spec registry from glossary, data-pipeline, testing
+  ([#849](https://github.com/tinaudio/synth-setter/pull/849),
+  [`2d26c90`](https://github.com/tinaudio/synth-setter/commit/2d26c906f8938fc084b1c3fb9d82ccc500aeafe3))
+
+* docs: link param_spec registry instead of baked-in counts
+
+* Apply suggestions from code review
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+* docs: restore param_spec_name and helper mentions now that #820 has merged
+
+Revert the partial-rollback in 0e7da28 that took out param_spec_name / _build_surge_xt_smoke_cfg
+  from the testing primer and doc-map covers string. Both symbols exist on main since #820 merged
+  (2026-05-07T21:19:08Z), so the docs can describe the steady-state behavior — also drops the "In
+  this branch" wording per review.
+
+Refs #848 Refs #820
+
+---------
+
+- Wire preset_paths registry into surge_xt_interactive
+  ([#868](https://github.com/tinaudio/synth-setter/pull/868),
+  [`14da23a`](https://github.com/tinaudio/synth-setter/commit/14da23a7c2e8b387fdc1f446230dcf15f927c276))
+
+* feat(scripts): wire preset_paths registry into surge_xt_interactive
+
+- Drop the `--preset-path` CLI flag; the base preset is selected by `preset_paths[param_spec_name]`.
+  A spec/preset mismatch is now unrepresentable. - `--param-spec-name` becomes a
+  `click.Choice(sorted(param_specs.keys()))` with `required=True` (was `str`, default `"surge_xt"`).
+  - `main()` resolves the preset path from the registry and threads the same string through
+  `make_dataset` and `_maybe_eval_captured_patches`, so the eval helpers' signatures (and their
+  tests) stay unchanged. - Update `docs/guides/surge-xt-interactive.md` CLI table, prerequisites,
+  and quick-start examples to drop the removed flag and pass `--param-spec-name` explicitly.
+
+Refs #866
+
+* docs(surge-xt-interactive): refresh Last-Updated and de-inline preset path
+
+Address doc-drift findings on PR #868:
+
+- Bump `Last Updated` from 2026-05-07 to 2026-05-08 (PR edit date). - Drop the inlined
+  `presets/surge-base.vstpreset` value from the troubleshooting note; point at the `preset_paths`
+  registry symbol so the troubleshooting tip stops baking the mapping value into prose.
+
+* docs(surge-xt-interactive): clarify preset_paths indexing notation
+
+Address Copilot review on PR #868 (3 inline comments, all the same nit): the literal
+  `preset_paths[--param-spec-name]` parses as Python subscript syntax with the CLI flag itself as
+  the key, which is not what we mean.
+
+- Prerequisites bullet: switch to `preset_paths[param_spec_name]` (the Python identifier
+  corresponding to the flag) and add a parenthetical explaining the keying. - Quick-start lead and
+  CLI-table cell: drop the bracket form entirely and use prose ("indexing `preset_paths` with the
+  value passed to `--param-spec-name`") so the wording is unambiguous regardless of whether a reader
+  expects Python syntax.
+
+### Features
+
+- **workflows**: Make generate-dataset-shards/validate-dataset-shards directly dispatchable
+  ([#867](https://github.com/tinaudio/synth-setter/pull/867),
+  [`4c78201`](https://github.com/tinaudio/synth-setter/commit/4c782015feeb7c71513255ff160336e7694c525d))
+
+* feat(workflows): make generate-dataset-shards/validate-dataset-shards directly dispatchable
+
+Both reusables were `workflow_call` only after the #858 split, which left them invokable from
+  `test-dataset-generation.yml` but not human-dispatchable via `gh workflow run` or the GitHub UI's
+  "Run workflow" button. Operators who wanted to fire the official launcher had to go through the
+  test wrapper.
+
+Adds `workflow_dispatch` triggers alongside the existing `workflow_call` on both files. Inputs
+  duplicated under each event (GHA can't share input definitions across events) but defaults differ:
+
+* `generate-dataset-shards.yaml` — workflow_dispatch makes `cluster_name` optional (default `''`); a
+  new `compute cluster_name` step at the start of the generate job synthesizes
+  `synth-setter-manual-<provider>-<run_id>- <run_attempt>` when empty so concurrent manual
+  dispatches don't collide on the launcher's R2 spec key. workflow_call's existing `cluster_name`
+  field is also relaxed to optional with the same fallback (test wrapper still passes a value,
+  behavior unchanged for it). * `validate-dataset-shards.yaml` — workflow_dispatch with `image_tag`
+  (default `dev-snapshot`) and `spec_uri` (required, no default — operator pastes the r2:// URI to
+  validate).
+
+PR-trigger and test-dataset-generation.yml call paths are unchanged.
+
+Closes #865
+
+* docs: reflect dispatchability of generate/validate-dataset-shards reusables
+
+doc-drift agent flagged that two doc surfaces describe the workflows as `workflow_call`-only after
+  this PR adds `workflow_dispatch`. Updated:
+
+* docs/design/storage-provenance-spec.md — Trigger column for both rows now lists `workflow_call`,
+  `workflow_dispatch`. * docs/reference/github-actions.md — Pipeline catalog rows reworded from
+  "Reusable workflow:" to "Reusable + dispatchable workflow:" with a short note that operators can
+  fire each one directly.
+
+Refs #865
+
+### Refactoring
+
+- **pipeline**: Coordinate workflow stages via R2 spec lookup
+  ([#863](https://github.com/tinaudio/synth-setter/pull/863),
+  [`70ee80f`](https://github.com/tinaudio/synth-setter/commit/70ee80fea7fb140306f207c010372452317bbbb8))
+
+* refactor(pipeline): coordinate workflow stages via R2 spec lookup
+
+Replaces the /tmp/run-metadata artifact-passing handoff with a direct R2 read so
+  validate-dataset-shards.yaml is decoupled from the artifact upload shape and can serve any caller
+  that puts a spec at a known r2:// URI.
+
+* `pipeline/r2_io.py` (new) — single rclone-backed I/O helper with `download_to_path`,
+  `upload_to_uri`, and `downloaded_to_tempfile` (context manager). All workflow rclone invocations
+  now go through this module. * `pipeline.ci.validate_spec` — accepts a local path or
+  `r2://bucket/key` URI; downloads via `r2_io` before validating. * `pipeline.ci.validate_shard` —
+  single-arg CLI now: `<spec_uri>`. Iterates `spec.shards` and pulls each from R2 (key derived from
+  `r2_bucket` + `r2_prefix` + `filename`). Per-shard validate errors are prefixed with the shard
+  filename. * `generate-dataset-shards.yaml` — emits `spec_uri` workflow output (deterministic from
+  `inputs.cluster_name` + the materialized spec's `r2_bucket`). * `validate-dataset-shards.yaml` —
+  replaces `artifact_name` input with `spec_uri`; drops the artifact download and per-shard
+  rclone-copy bash loop. Two jobs (validate-spec on a runner, validate-shard inside dev-snapshot for
+  h5py) both consume the URI directly. * `test-dataset-generation.yml` — `setup` now also extracts
+  the R2 bucket from `configs/image/dev-snapshot.yaml` so the validate matrix can construct each
+  provider's `spec_uri` deterministically. The `generate-local` job gains an explicit upload step
+  that writes the spec to the same `skypilot-launcher-specs/<cluster_name>.json` key the launcher
+  uses for the other providers, so validate is fully provider-agnostic.
+
+The run-metadata artifact upload remains for failure debugging but is no longer load-bearing for
+  stage handoff.
+
+Closes #862
+
+* docs: fix stale artifact-handoff references after R2-coord refactor
+
+doc-drift agent flagged 4 high-confidence stale references. Updated:
+
+* docs/reference/github-actions.md — Pipeline catalog rows for generate-dataset-shards (now mentions
+  spec_uri output) and validate-dataset-shards (now describes R2 spec_uri input, not artifact).
+  Artifact-chains bullet rewritten to call out the artifact is debugging-only, validate reads from
+  R2. * docs/design/storage-provenance-spec.md — Data Validation row's Key Inputs column:
+  artifact_name → spec_uri. * docs/doc-map.yaml — validate-dataset-shards covers updated to the
+  spec_uri handoff; generate-dataset-shards covers appended to mention the spec_uri output; new
+  pipeline/r2_io.py mapping pointing at docs/design/data-pipeline.md.
+
+Refs #862
+
+* docs: refresh pipeline/ tree in data-pipeline.md for r2_io.py + missing ci modules
+
+The §14.7 directory listing was already drifted (omitted validate_spec.py, materialize_spec.py); the
+  R2-coord refactor adds pipeline/r2_io.py which also needed inclusion. Updated to list all current
+  ci/ modules and the new top-level r2_io.py module.
+
+* fix(workflows): install PyYAML in setup job before parsing image config
+
+Copilot review on PR #863 flagged that the `setup` job's python yaml.safe_load on
+  configs/image/dev-snapshot.yaml runs on a fresh ubuntu-latest runner that doesn't have PyYAML
+  installed (the workflow doesn't run inside dev-snapshot). Adds an explicit `pip install pyyaml`
+  step before the bucket extraction.
+
+* fix(workflows): read r2_bucket from dataset config, not image config
+
+Copilot review on PR #863 caught that the spec_uri the validate matrix constructs uses
+  configs/image/dev-snapshot.yaml's r2_bucket, but the launcher's upload destination is driven by
+  spec.r2_bucket which comes from the *dataset* config. They match for runpod-smoke-shard.yaml but
+  diverge for configs like 10-1k-shards.yaml (`experiments` bucket).
+
+Setup job now extracts r2_bucket from inputs.dataset_config (with the same PR-default fallback the
+  generate-* jobs use). Also tightens the doc-map.yaml covers text for validate-dataset-shards to
+  make clear which workflow emits the spec_uri.
+
+
 ## v0.13.1 (2026-05-08)
 
 ### Bug Fixes
