@@ -22,12 +22,11 @@ from pathlib import Path
 
 from loguru import logger
 
+from pipeline import r2_io
 from pipeline.constants import INPUT_SPEC_FILENAME
 from pipeline.partitioning import get_my_shards, read_rank_world_from_env
 from pipeline.schemas.spec import DatasetSpec, ShardSpec
 from src.data.vst.core import extract_renderer_version
-
-_R2_URI_SCHEME = "r2://"
 
 
 def load_spec_from_uri(spec_uri: str) -> DatasetSpec:
@@ -42,18 +41,8 @@ def load_spec_from_uri(spec_uri: str) -> DatasetSpec:
     error (see #749), so the launcher ships the spec via R2 instead of
     file_mounts.
     """
-    if spec_uri.startswith(_R2_URI_SCHEME):
-        rclone_path = "r2:" + spec_uri[len(_R2_URI_SCHEME) :]
-        with tempfile.TemporaryDirectory() as tmpdir:
-            args = [  # noqa: S607 — rclone resolved by image's PATH
-                "rclone",
-                "copy",
-                "--checksum",
-                rclone_path,
-                tmpdir,
-            ]
-            subprocess.check_call(args)  # noqa: S603 — args from validated spec URI
-            local_path = Path(tmpdir) / Path(spec_uri).name
+    if r2_io.is_r2_uri(spec_uri):
+        with r2_io.downloaded_to_tempfile(spec_uri) as local_path:
             spec_text = local_path.read_text()
     else:
         spec_text = Path(spec_uri).read_text()
@@ -142,6 +131,11 @@ def run(spec: DatasetSpec) -> None:
     to one shard at a time. Subprocess failures propagate immediately
     (fail-fast); later shards are not attempted.
 
+    Before each render, R2 is probed for the shard's destination object: if it already exists with
+    non-zero size, the shard is skipped (resumability MVP — see #750). The probe uses
+    ``check=True``, so a non-zero rclone exit (auth, network) propagates as a hard failure rather
+    than degrading silently into a re-render.
+
     HDF5-only for now: ``spec.output_format`` is restricted to ``"hdf5"``.
 
     Raises:
@@ -191,8 +185,24 @@ def run(spec: DatasetSpec) -> None:
         _rclone_copy(str(spec_path), r2_dest_prefix)
         logger.info(f"spec uploaded -> {r2_dest_prefix}")
 
+        rendered = 0
+        skipped = 0
         for shard_id in my_range:
-            _render_and_upload_shard(spec, spec.shards[shard_id], work_dir, r2_dest_prefix)
+            shard = spec.shards[shard_id]
+            shard_object_uri = r2_io.shard_uri(spec.r2_bucket, spec.r2_prefix, shard.filename)
+            existing_size = r2_io.object_size(shard_object_uri)
+            if existing_size is not None and existing_size > 0:
+                logger.info(
+                    f"skipping shard {shard.shard_id} — already in R2 "
+                    f"({existing_size} bytes): {shard.filename}"
+                )
+                skipped += 1
+                continue
+            _render_and_upload_shard(spec, shard, work_dir, r2_dest_prefix)
+            rendered += 1
+        logger.info(
+            f"shard summary: rendered={rendered} skipped={skipped} of {len(my_range)} assigned"
+        )
 
 
 def _render_and_upload_shard(
