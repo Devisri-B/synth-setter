@@ -1,6 +1,314 @@
 # CHANGELOG
 
 
+## v0.15.0 (2026-05-11)
+
+### Documentation
+
+- **claude-md**: Mandate /tdd-implementation, /code-health, /simplify on code changes
+  ([#903](https://github.com/tinaudio/synth-setter/pull/903),
+  [`a24410b`](https://github.com/tinaudio/synth-setter/commit/a24410b52ada78b8dfecfedb12072a8c1d61dd96))
+
+* docs(claude-md): mandate tdd/code-health/simplify on code changes
+
+Adds a hard rule under "Implementation Approach" requiring Claude to invoke /tdd-implementation,
+  /code-health, and /simplify (in order) whenever it implements or modifies non-documentation code.
+  Pure documentation edits (.md, docs/) remain exempt.
+
+Refs #902
+
+* docs(claude-md): disclose plugin/builtin origin of mandatory skills
+
+Addresses Copilot review comment on PR #903: the new "Mandatory Skills for Code Changes" section
+  listed `/tdd-implementation`, `/code-health`, and `/simplify` as if they were repo-local slash
+  commands, but only `/repo-review` and `/repo-review-full` are defined under `.claude/skills/`. Two
+  come from the `tinaudio-synth-setter-skills` plugin and `/simplify` is a Claude Code built-in.
+  Adds a one-line disclosure (mirroring how `/repo-review-full`'s plugin dependency is documented
+  elsewhere) so contributors on a fresh install understand what must be available for the rule to
+  apply.
+
+- **claude-md**: Require inline replies on PR review comments
+  ([#901](https://github.com/tinaudio/synth-setter/pull/901),
+  [`c641d59`](https://github.com/tinaudio/synth-setter/commit/c641d59afab6a84860926908ec731d3e676c9929))
+
+* docs: require inline replies on PR review comments
+
+Update the PR Review Comments section in CLAUDE.md to require that Claude reply inline on the
+  specific review comment a pushed change addresses, rather than posting a generic top-level PR
+  comment. When a change covers multiple review comments, post a separate inline reply on each — do
+  not consolidate them elsewhere on the PR.
+
+This keeps each reviewer thread accurately resolved and makes it easy for the reviewer to trace
+  which commit addresses which note.
+
+* Potential fix for pull request finding
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+### Features
+
+- **pipeline**: Skip-existing-shards check in generate_dataset loop
+  ([#877](https://github.com/tinaudio/synth-setter/pull/877),
+  [`1a72cde`](https://github.com/tinaudio/synth-setter/commit/1a72cde3a66d76005a0d20b6cf49fd037a47cff3))
+
+* feat(pipeline): skip-existing-shards check in generate_dataset loop
+
+Workers now probe R2 via `rclone lsf --format=s` before rendering each assigned shard; if the
+  destination object already exists with non-zero size, the shard is skipped. End-of-run summary
+  reports rendered and skipped counts over the assigned range. Probe failures fail-fast — a non-zero
+  rclone exit propagates as `CalledProcessError` so environmental issues (auth, network) surface
+  rather than silently re-rendering.
+
+Implements the worker-side resumability MVP for #750, sitting on top of the multi-shard loop landed
+  in #755. Long-term home is the launcher-side reconciliation engine (#104) per design doc §7.7,
+  which frames skip-if-valid as an optimization, not a correctness requirement.
+
+Adds `r2_io.shard_uri` and `r2_io.object_size` typed primitives; `shard_uri` consolidates the
+  `r2://{bucket}/{prefix}{filename}` construction previously duplicated between the worker
+  entrypoint and the CI shard validator.
+
+* docs(pipeline): note worker-side skip-existing-shards in data-pipeline.md and doc-map
+
+Updates the implementation-status callout in data-pipeline.md and the covers entries in doc-map.yaml
+  so future audits don't re-flag the same drift. Also rewrites the r2_io public-helper enumeration
+  as a non-enumerative pointer ("URI handling, download, upload, size probe") so the next addition
+  to r2_io.py doesn't require another doc edit.
+
+Refs #750
+
+* refactor(pipeline): consolidate r2:// handling in load_spec_from_uri
+
+Replace the inline `_R2_URI_SCHEME` constant + manual rclone subprocess in `load_spec_from_uri` with
+  `r2_io.is_r2_uri` and `r2_io.downloaded_to_tempfile`, removing the duplicated scheme-detection /
+  scheme-translation logic that the PR otherwise tries to centralize in `pipeline.r2_io`.
+
+Single source of truth for R2 URI handling now lives in `r2_io`; addresses review feedback on PR
+  #877.
+
+### Internal-Feat
+
+- **configs**: Add Hydra dataset config tree + DatasetSpec hardening
+  ([#907](https://github.com/tinaudio/synth-setter/pull/907),
+  [`9f865ec`](https://github.com/tinaudio/synth-setter/commit/9f865ec0b981be6b3d0978d19ea15e124100443d))
+
+* internal-feat(configs): add Hydra dataset config tree + DatasetSpec hardening
+
+Follow-up to PR-1 (#887). Adds the Hydra-composable dataset config tree that PR-3 will hook into
+  when migrating the entrypoint to @hydra.main. Hardens DatasetSpec to match the trust boundary the
+  new compose path needs.
+
+## Configs (added; legacy configs/dataset/*.yaml stays through PR-2)
+
+- configs/dataset.yaml — top-level @hydra.main composition target -
+  configs/render/{surge_xt,surge_simple}.yaml — renderer params, batch_per_shard, renderer_version -
+  configs/r2/default.yaml — bucket + prefix_root -
+  configs/experiment/{ci-materialize-test,runpod-smoke-shard,
+  surge-simple-480k-10k,10-1k-shards}.yaml — Hydra defaults files composing dataset/render/r2 groups
+  - tests/pipeline/test_configs/test_experiment_yamls.py — composes each experiment via Hydra and
+  round-trips through DatasetSpec
+
+wds-format experiment variants and the corresponding output_format expansion are out of scope (per
+  the handoff hard rule that output_format stays restricted to hdf5 in PR-2; wds lands with #874's
+  PR-12/13/14 tail).
+
+## DatasetSpec hardening (pipeline/schemas/spec.py)
+
+- Re-add `strict=True` so silent int→str / str→bool coercion at the trust boundary is rejected -
+  Switch train_val_test_sizes / train_val_test_seeds from tuple[int,int,int] to list[int] with
+  Field(min_length=3, max_length=3) so JSON round-trip works under strict (JSON has no tuple type) -
+  Replace the post-construction `_populate_derived_runtime_fields` model_validator (which used
+  `object.__setattr__` to bypass `frozen=True`) with `Field(default_factory=_default_run_id)` /
+  `_default_r2_prefix` helpers — the data dict comes from Pydantic with already-validated earlier
+  fields, so run_id / r2_prefix derive cleanly without the immutability workaround - New
+  `_parse_iso_datetime` field_validator on `created_at` — normalizes the trailing `Z` offset that
+  `model_dump_json` emits for UTC (Python 3.10's fromisoformat rejects it; 3.11+ accepts) - Tighten
+  `_r2_prefix_must_end_with_slash` — drop the `if value and` guard since default_factory always
+  populates - Lift `("train", "val", "test")` to a module-level `_SPLIT_LABELS` constant; replace
+  OmegaConf.to_container's `# type: ignore` with `cast`
+
+train_val_test_seeds is reserved for per-sample seeding (#884); not consumed yet.
+  Required-but-unused, defaulted at configs/dataset.yaml so experiments don't all repeat the same
+  triple.
+
+## What stays through PR-2 (removed in PR-3)
+
+- load_dataset_spec_yaml and the legacy configs/dataset/*.yaml shape - pipeline.ci.materialize_spec
+  - The four CI workflows that point at configs/dataset/*.yaml (test-spec-materialization,
+  test-dataset-generation, test-skypilot-debug, generate-dataset-shards)
+
+## Verification
+
+- make test-fast: 474 passed (PR-1 baseline 457 + 8 new experiment YAML round-trip tests + 9 new
+  schema-hardening behavioral pins) - make format: all pre-commit hooks green (ruff, ruff-format,
+  pyright, docformatter, mdformat, codespell, …)
+
+Part of #906
+
+* docs(tests): clarify docstrings on dataset-spec / experiment-yaml tests
+
+Address Copilot review feedback on PR #907:
+
+- test_experiment_yamls.py: rewrite the module docstring + DATASET_EXPERIMENTS inline comment to
+  make explicit that the round-trip suite runs against a curated allowlist (not every YAML under
+  configs/experiment/). The previous wording implied a universal sweep and only mentioned the nested
+  train-side subdirectories as exclusions, missing top-level train-side configs like
+  time_weighting.yaml.
+
+- test_dataset_spec.py: in test_explicit_empty_r2_prefix_raises, attribute the rejection to the
+  _r2_prefix_must_end_with_slash field validator instead of the default_factory. The factory is
+  bypassed when an explicit value is supplied; the field validator is what fires.
+
+Refs #907
+
+* internal-fix(schemas): address Copilot review round 2 on PR #907
+
+Four findings from the second Copilot pass after the schema hardening in `ec3ab21`. All four are
+  valid and now fixed + pinned with tests.
+
+- pipeline/schemas/spec.py: enforce tz-aware UTC in `_parse_iso_datetime` (#3217285071).
+  `datetime.fromisoformat` accepts naive and non-UTC timestamps, which downstream surface as a
+  `run_id` derivation crash via `make_dataset_wandb_run_id`. The validator now raises a clear
+  `created_at must be timezone-aware UTC` / `created_at must be UTC` message so error attribution
+  stays at the trust boundary. Pinned with `test_naive_created_at_string_raises` +
+  `test_non_utc_created_at_string_raises`.
+
+- pipeline/schemas/spec.py: switch `train_val_test_sizes` / `train_val_test_seeds` from `list[int] +
+  Field(min_length=3, max_length=3)` back to `tuple[int, int, int]` with a new
+  `_splits_list_to_tuple` `field_validator(mode="before")` that coerces JSON-loaded lists to tuples
+  and validates length (#3217285171). The list form leaked in-place mutability past `frozen=True` —
+  `spec.train_val_test_sizes[0] = X` would silently invalidate the cached `shards` / `num_shards`.
+  Tuples are immutable end-to-end. Pinned with `test_train_val_test_sizes_stored_as_immutable_tuple`
+  (in-place mutation raises TypeError) and `test_train_val_test_sizes_accepts_json_list` (JSON
+  round-trip still works).
+
+- configs/dataset.yaml: add `- paths: default` to defaults (#3217285124).
+  `configs/hydra/default.yaml`'s `${paths.log_dir}` interpolation would otherwise fail under
+  `@hydra.main` in PR-3. train.yaml + eval.yaml already follow this pattern.
+
+- tests/pipeline/test_configs/test_experiment_yamls.py: drop unused `+dataset_root=/dev/null`
+  override (#3217285148). No `${dataset_root}` interpolations exist in the composed tree; the
+  override was dead noise. Replaced with a pin on `cfg.paths.root_dir` / `cfg.paths.output_dir` /
+  `cfg.paths.work_dir` so `resolve=True` handles the new `paths` group without depending on
+  `$PROJECT_ROOT` or `@hydra.main`-only resolvers (mirrors the train/eval pattern in
+  `tests/conftest.py`).
+
+Test count: 474 → 478 (4 new behavioral pins).
+
+* fix(tests): use tuple literals for train_val_test_sizes/seeds
+
+The DatasetSpec fields were switched to tuple[int, int, int] in adf2a14 for immutability; this test
+  was missed and pyright failed on the list[int] args.
+
+Refs #906
+
+* docs(tests): list paths: group in experiment-yamls docstring
+
+The _compose_dataset_spec helper drops paths along with data/r2/hydra, but the docstring only
+  mentioned the latter three. Generalize the wording so it stays accurate if the dropped-group list
+  changes.
+
+- **schemas**: Unify DatasetConfig + DatasetPipelineSpec into DatasetSpec
+  ([#887](https://github.com/tinaudio/synth-setter/pull/887),
+  [`1181351`](https://github.com/tinaudio/synth-setter/commit/1181351e9c287dfdd8f4f25e3acb88fd3fe8c3e5))
+
+* internal-feat(schemas): unify DatasetConfig + DatasetPipelineSpec into DatasetSpec
+
+Replace the prior split between DatasetConfig (YAML-shaped config) and DatasetPipelineSpec
+  (runtime-materialized artifact) with a single DatasetSpec model whose model_dump_json() is the
+  artifact written to R2. Renderer-specific fields move to a nested RenderConfig sub-model. Runtime
+  fields (git_sha, is_repo_dirty, created_at, run_id, r2_prefix) auto-fill via default_factory when
+  missing and pass through when present in JSON-loaded input. shards / num_shards / num_params are
+  computed deterministically as @computed_field cached_properties.
+
+SURGE_XT_RENDERER_VERSION moves out of the schema into RenderConfig as a config field; the worker
+  still verifies the running plugin version matches the pinned value before rendering.
+
+A legacy YAML loader (load_dataset_spec_yaml) keeps the launcher and ci.materialize_spec working
+  through this PR; both are removed in a follow-up PR once the entrypoint migrates to @hydra.main.
+
+The launcher's num_workers knob now lives on the CLI only (default 1); the legacy YAML field is
+  silently ignored.
+
+output_format remains restricted to "hdf5" — wds support lands later in the chain.
+
+Closes #886 Part of #882
+
+* fix(compute): invoke synced docker_entrypoint.py, not stale baked path
+
+The skypilot templates execed /usr/local/bin/entrypoint.py — the copy baked into the dev-snapshot
+  image. After the pipeline/ → src/pipeline/ relocation and src/generate_dataset.py entrypoint move,
+  the in-image script's imports ('from pipeline.entrypoints.generate_dataset ...') stopped resolving
+  and PR workers failed with ModuleNotFoundError: No module named 'pipeline'.
+
+sync_worker_checkout.sh already updates /home/build/synth-setter to the PR head ref before launch,
+  so invoke scripts/docker_entrypoint.py from the synced checkout instead. The Dockerfile still
+  bakes the same script at /usr/local/bin/entrypoint.py for the no-sync (no WORKER_GIT_REF)
+  fallback.
+
+Refs #882
+
+* ci(workflows): install pydantic + pyyaml + omegaconf for validate-spec runner step
+
+After unifying DatasetConfig + DatasetPipelineSpec into a single Pydantic DatasetSpec,
+  `pipeline.ci.validate_spec` imports `pipeline.schemas.spec.DatasetSpec`. The spec module
+  transitively imports pydantic, pyyaml (for the load_dataset_spec_yaml bridge function), and
+  omegaconf — none of which are on the runner's bare Python install.
+
+Install only those three packages to keep the runner-side env minimal instead of pulling the full
+  requirements.txt (which would drag in torch and the rest of the training stack).
+
+* internal-fix(schemas): address Copilot review feedback on PR #887
+
+- pipeline/schemas/spec.py _strip_computed_field_keys: copy the input mapping before popping
+  computed keys so callers holding the dict (logging, retries) see it unchanged (Copilot
+  #3216318943). - pipeline/schemas/spec.py legacy YAML bridge: raise ValueError when legacy
+  'num_shards' disagrees with sum(splits) instead of silently computing a different shard count
+  (Copilot #3216318975). - pipeline/schemas/prefix.py make_r2_prefix: strip leading/trailing slashes
+  from prefix_root so 'data/' and '/data' both produce a clean prefix instead of doubled slashes;
+  reject empty-after-strip with a clear error (Copilot #3216319001). - pipeline/schemas/spec.py
+  OUTPUT_FORMAT_TO_EXTENSION: rename from the private '_OUTPUT_FORMAT_TO_EXTENSION' and add to
+  __all__ so pipeline.ci.validate_spec is no longer reaching across a private boundary (Copilot
+  #3216319015). - pipeline/ci/validate_spec.py: validate output_format in validate_structure and
+  look up extension via .get(...) in validate_test_values so an unknown format produces a structural
+  error instead of a KeyError crash (Copilot #3216319025).
+
+Also adds the missing docstrings required by interrogate (80% threshold) on the touched files: the
+  validator/computed-field methods in spec.py that lacked them, and the existing tests in
+  test_dataset_spec.py that were previously undocumented.
+
+* internal-fix(schemas): defer param_specs import inside num_params
+
+`pipeline.schemas.spec` top-level imported `from src.data.vst import param_specs`, which
+  transitively pulls `src.data.vst.core` → `mido` + `pedalboard`. The validate-spec runner doesn't
+  install those, so `python -m pipeline.ci.validate_spec` on the GitHub runner aborts with
+  `ModuleNotFoundError: No module named 'mido'` before any validation runs.
+
+Move the import inside `num_params`'s body — the only call site. Side effects of
+  `src.data.vst.__init__` (mido / pedalboard imports) now only happen when a spec's `num_params` is
+  actually evaluated, not when the schema module is imported. `validate_spec` only consumes the
+  module-level `OUTPUT_FORMAT_TO_EXTENSION` constant, so the deferred import is fine for that code
+  path.
+
+* internal-fix(schemas): address second Copilot review round on PR #887
+
+- pipeline/schemas/spec.py: add `frozen=True` to `DatasetSpec` and `RenderConfig` so the
+  `@cached_property` computed fields (`shards`, `num_shards`, `num_params`) cannot go stale via
+  post-construction field mutation. The internal `_populate_derived_runtime_fields` validator
+  already uses `object.__setattr__`, which bypasses Pydantic's frozen guard, so init-time
+  runtime-field population still works.
+
+- pipeline/entrypoints/generate_dataset.py: replace the misleading "renderer CLI dispatches on
+  filename suffix" claim in both `build_generate_args` and `run` docstrings with HDF5-only reality.
+  Drop the `configs/render/<spec>.yaml` / `configs/render/surge_xt.yaml` references in the
+  renderer-version inline comment and error message (this PR keeps materialization in legacy
+  `configs/dataset/*.yaml`; the Hydra `configs/render/` group lands in PR-2).
+
+- src/data/vst/core.py: drop the `configs/render/<spec>.yaml` reference in
+  `extract_renderer_version`'s docstring.
+
+
 ## v0.14.1 (2026-05-11)
 
 ### Bug Fixes
