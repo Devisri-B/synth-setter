@@ -38,6 +38,7 @@ markers = [
   "r2: tests requiring R2/rclone access",
   "docker_smoke: smoke tests that run inside the built Docker image",
   "network: tests that may make outbound network calls (e.g. `git fetch`)",
+  "infra: tests that assert invariants of the devcontainer + GitHub Actions configuration",
 ]
 minversion = "6.0"
 testpaths = "tests/"
@@ -205,6 +206,7 @@ exclude = '''(?x)
   | ^tests/pipeline/test_schemas/test_dataset_spec\.py$
   | ^tests/pipeline/test_schemas/test_image_config\.py$
   | ^tests/pipeline/test_schemas/test_prefix\.py$
+  | ^tests/infra/
   | ^tests/scripts/test_compute_audio_metrics\.py$
   | ^tests/scripts/test_r2_shard_report\.py$
   | ^tests/scripts/test_skypilot_write_provider_creds\.py$
