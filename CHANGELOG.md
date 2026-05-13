@@ -1,6 +1,147 @@
 # CHANGELOG
 
 
+## v4.0.1 (2026-05-13)
+
+### Bug Fixes
+
+- **metrics**: Surface zero-variance mel bins in stats.npz instead of corrupting normalization
+  ([#1002](https://github.com/tinaudio/synth-setter/pull/1002),
+  [`210e967`](https://github.com/tinaudio/synth-setter/commit/210e96723110546066cbd7420a1edcc958720ef9))
+
+* fix(pipeline): surface zero-variance mel bins in stats.npz instead of corrupting normalization
+
+`scripts/get_dataset_stats.py` previously wrote `stats.npz` files with `std=0` entries when a mel
+  bin was constant across the dataset (e.g. small or silence-heavy corpora). Downstream `(spec -
+  mean) / std` in the audio and Surge datamodules then produced inf/nan in those bins and silently
+  degraded training.
+
+Fix:
+
+- Stats script raises by default when degenerate bins are detected, naming the bin indices.
+  `--mask-degenerate-bins` opts in to writing `std=0` for those bins. - Datamodules precompute
+  `scale = 1/std` with degenerate bins masked to 0 via a shared `compute_scale` helper, and
+  normalize as `(spec - mean) * scale`. Zero-variance bins now contribute a constant zero rather
+  than divide-by-zero output. - File schema is unchanged. Pre-existing `stats.npz` files with
+  `std=0` are now interpreted as masked rather than corrupting training.
+
+Switched the stats script from loguru to stdlib logging to align with CLAUDE.md ("Use Python's
+  logging module elsewhere"). Replaced bare `sys.argv[1]` with argparse to expose the new flag.
+
+Closes #998
+
+* fix(pipeline): handle count<=1 and multi-D std in degeneracy check
+
+End-to-end CLI verification on a single-sample synthetic dataset surfaced two latent issues in the
+  original #998 fix:
+
+1. `finalize()` with count==1 hit the `if count > 1 else 0` branch and produced a Python scalar `0`
+  for variance instead of a zero array. `np.where(scalar == 0)` then crashed before the degeneracy
+  guard could format an error message. Fixed: count==0 raises with a clear message; count==1
+  produces a proper zero variance array (M2 is already an ndarray after the first `update`), which
+  the degeneracy check then flags correctly.
+
+2. `_check_degenerate_bins` used `np.where(std == 0)[0]` which only returns first-axis indices. On
+  real Surge mel specs (shape `(channels, mels, frames)`) this collapsed every degenerate element to
+  a duplicated channel-axis index. Fixed: switched to `np.argwhere` for multi-D std (coordinate
+  tuples), kept `np.where` for 1-D (flat indices). Added `np.asarray(std)` at the boundary so torch
+  tensors (returned by datamodule `__getitem__`) are iterated correctly.
+
+3. Capped the index preview at 20 entries with a `+N more` suffix so a fully-degenerate 100k-element
+  mel spec produces a readable error instead of a megabyte-scale message.
+
+Added regression tests for count==0, count==1, multi-D coordinates, and the overflow-summary path.
+
+Refs #998
+
+* fix(pipeline): address Copilot review on stats degenerate-bin handling
+
+- scripts/get_dataset_stats.py: configure stdlib logging in __main__ so progress and "Saving to..."
+  INFO messages surface (was suppressed at the default WARNING root level after the loguru → stdlib
+  switch). - src/synth_setter/data/audio_datamodule.py: guard __getitem__ on both self.mean and
+  self.scale, matching SurgeXTDataset and removing a latent TypeError if the two attributes get out
+  of sync. - src/synth_setter/data/stats_utils.py: reject non-finite (NaN/inf) and negative std in
+  compute_scale instead of silently masking to 0; corrupted stats.npz now fails loudly with a
+  regeneration hint. - tests/data/test_stats_utils.py: cover the three new ValueError paths.
+
+* refactor(pipeline): move degenerate-bin masking into stats writer, leave datamodules untouched
+
+Substitute std=1.0 (rather than std=0) at degenerate positions when --mask-degenerate-bins is set.
+  Because Welford's mean converges to the constant value for any bin that was constant during stat
+  collection, downstream (spec - mean) / std then yields 0 on the training distribution — equivalent
+  to a constant-zero mask, but expressed entirely in the stats file rather than in the datamodule.
+
+This lets the audio and surge datamodules stay exactly as they were pre-PR: the existing (spec -
+  mean) / self.std arithmetic continues to work because no std==0 ever reaches it.
+
+Removed: - src/synth_setter/data/stats_utils.py and its tests (compute_scale has no callers once the
+  datamodule changes are reverted). - tests/data/test_datamodule_stats_scale.py (covered behavior
+  that's now back to its original implementation).
+
+Tradeoff: pre-existing stats.npz files written before this PR that contain literal std=0 entries are
+  no longer auto-handled by the datamodule (the original PR interpreted them as masks). Those
+  artifacts now need to be regenerated with --mask-degenerate-bins.
+
+* refactor(pipeline): keep the mask_degenerate=False path structurally identical to pre-PR
+
+Restore pre-PR layout in finalize() and get_stats_hdf5():
+
+- finalize(): keep `variance = M2/count if count > 1 else 0` verbatim; only insertion is `std =
+  _check_degenerate_bins(std, mask_degenerate)` before `return mean, std`. Dropped the explicit `if
+  count == 0: raise` guard — the count<=1 case is now caught by a 0-d ndim guard inside
+  `_check_degenerate_bins`, so the surrounding logic stays unchanged. - get_stats_hdf5(): restore
+  the original ordering of `print("Saving to file...")`, `out_file = ...`, and the two `.compute()`
+  calls. The degeneracy check is a single inserted line right before `np.savez`. -
+  get_stats_directory(): revert cosmetic f-string → %-format changes on `logger.info(...)` lines.
+  The only change here is threading `mask_degenerate` through to `finalize()`.
+
+The check function gains a 0-d guard at the top that raises a distinct "<=1 samples" error for
+  scalar std inputs (which the `if count > 1 else 0` branch in finalize produces for
+  empty/single-sample states). Merged the previous empty-state and single-sample tests into one that
+  exercises both via the new guard.
+
+* fix(pipeline): tighten _check_degenerate_bins memory + dtype, dedupe test import
+
+Address Copilot review on commit 59b7b96:
+
+- scripts/get_dataset_stats.py: compute mask once, slice indices before .tolist() so a
+  fully-degenerate (~100k-element) mel doesn't allocate a 100k-tuple Python list just to print 20.
+  Honours _MAX_DEGENERATE_INDEX_PREVIEW in cost, not just in message size. -
+  scripts/get_dataset_stats.py: replace np.where(std == 0, 1.0, std) with a copy + dtype-preserving
+  assignment so float32 stats arrays stay float32 on disk instead of silently promoting to float64.
+  - tests/scripts/test_get_dataset_stats.py: thread the module-scoped stats_script fixture through
+  _existing_from_samples so the helper doesn't re-import the script (and re-run
+  rootutils.setup_root) on every call. - tests/scripts/test_get_dataset_stats.py: pin float32 dtype
+  preservation with a regression test so a future revert to the float-promoting np.where form fails
+  loudly.
+
+* refactor(pipeline): split _check_degenerate_bins into check/fix to clarify the no-mutate default
+  path
+
+Addresses inline review comment on PR #1002. Splits the single ``_check_degenerate_bins(std,
+  mask_degenerate)`` into:
+
+- ``_check_degenerate_bins(std) -> None`` — pure check, raises if any bin is degenerate. Never
+  mutates. Used by the default ``mask_degenerate=False`` path. - ``_fix_degenerate_bins(std) ->
+  np.ndarray`` — substitutes ``std=1.0`` at degenerate positions and returns the patched array. Used
+  by the ``--mask-degenerate-bins`` opt-in path.
+
+Both helpers delegate index finding/formatting to a shared ``_locate_degenerate_bins`` that returns
+  an ``Optional[ _DegenerateBinsFound]`` NamedTuple (or raises on 0-d std). The 0-d guard (count<=1)
+  lives there so both check and fix uniformly refuse single-sample datasets.
+
+Caller dispatch in ``finalize`` and ``get_stats_hdf5`` is now an explicit if/else:
+
+if mask_degenerate: std = _fix_degenerate_bins(std) else: _check_degenerate_bins(std)
+
+so it's immediately obvious from reading the call site that the default path does not mutate the std
+  array.
+
+Tests split symmetrically: each scenario lives on the helper that implements it. New test exercises
+  both helpers' 0-d guard via ``finalize(..., mask_degenerate=True)`` to pin that masking can't
+  paper over a count<=1 dataset.
+
+
 ## v4.0.0 (2026-05-13)
 
 ### Chores
