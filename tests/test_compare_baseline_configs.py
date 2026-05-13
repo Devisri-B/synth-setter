@@ -53,9 +53,9 @@ EXPECTED_KOSC_TASKS = 44
 EXPECTED_SURGE_TASKS = 8
 
 # Predict scripts under ``jobs/predict/``. These are single-shot (no SGE_TASK_ID
-# fan-out); each script invokes ``python src/eval.py`` once with a fixed set of
-# Hydra overrides. ``get-ckpt-from-wandb.sh`` is intentionally excluded — it's a
-# helper sourced by the others, not a standalone entrypoint.
+# fan-out); each script invokes ``python -m synth_setter.cli.eval`` once with a
+# fixed set of Hydra overrides. ``get-ckpt-from-wandb.sh`` is intentionally
+# excluded — it's a helper sourced by the others, not a standalone entrypoint.
 PREDICT_SCRIPTS: tuple[str, ...] = (
     "jobs/predict/ffn-fsd50k.sh",
     "jobs/predict/ffn-full.sh",
@@ -82,11 +82,13 @@ PREDICT_SCRIPTS: tuple[str, ...] = (
 # fetches the requested ref itself when needed (see `try_fetch_ref`).
 # FIXTURE_BASELINE pins the synthetic-fixture equality + inequality tests.
 # MODEL_BASELINE pins the K-OSC + SURGE train.sh tests against a known-good
-# model-config snapshot (tag v0.0.0, == 79552d2).
+# model-config snapshot.
 # Update on PR merge: MODEL_BASELINE bumps when a published-results-relevant
 # config change lands and a new release tag is cut.
 FIXTURE_BASELINE = "1bfa7ea9c4b237a4561a9ac546a3e241ecff5951"  # PR #679 merge commit on main
-MODEL_BASELINE = "v0.0.0"
+# Pinned to the initial commit of the Phase 2 src-layout migration (#989) — re-bump to
+# a post-merge tag once #989 lands on main.
+MODEL_BASELINE = "4e0895090f193464a1b716b50e0b2e10a55be2dd"
 
 
 @dataclass(frozen=True)

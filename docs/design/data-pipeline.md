@@ -51,7 +51,7 @@ At research scale (500k–15M samples), the single-machine approach breaks down.
 ### Distributed Pipeline
 
 > **Implementation status:** Single-machine sequential multi-shard generation is
-> implemented today (`src/generate_dataset.py` loops over
+> implemented today (`src/synth_setter/cli/generate_dataset.py` loops over
 > `spec.shards`, skipping shards already present in R2 — worker-side
 > resumability MVP per #750; the launcher-side reconciliation engine described
 > in §7.4 / §7.7 is not yet built). The distributed/parallel pipeline described
@@ -82,7 +82,7 @@ cat configs/experiment/surge-simple-480k-10k.yaml
 # → task_name: surge-simple-480k-10k, defaults: [/data: surge_simple, /render: surge_simple, ...], ...
 
 # 2. Run sequential multi-shard generation on a single worker.
-python -m src.generate_dataset experiment=surge-simple-480k-10k
+python -m synth_setter.cli.generate_dataset experiment=surge-simple-480k-10k
 # → Loops over spec.shards, skipping shards already present in R2 (worker-side resumability MVP, #750).
 # **Planned CLI** — the distributed pipeline CLI (`python -m src.pipeline generate/status/finalize`)
 # is not yet implemented; `generate_dataset` is the current MVP, deprecated when
@@ -786,7 +786,7 @@ def _render_shard(shard_spec, shard_path):
     The import happens here, in the child, so the VST plugin loads cleanly.
     """
     import numpy as np
-    from src.data.vst.generate_vst_dataset import make_hdf5_dataset
+    from synth_setter.data.vst.generate_vst_dataset import make_hdf5_dataset
     # P3 (post-launch): seed both RNGs for reproducibility — see #100
     # random.seed(shard_spec.seed)
     # np.random.seed(shard_spec.seed)
@@ -1392,7 +1392,7 @@ render:
 
 `configs/dataset.yaml` is the `@hydra.main` entry. Its `defaults` list pulls in `data:` (param spec / channels / velocity / loudness floor), `render:` (renderer + plugin / preset / sample rate / batch sizes), `r2:` (bucket + prefix root), `paths:`, `hydra:`, and the named `experiment:`. Required slots are marked `???` and filled by the chosen experiment.
 
-On first `generate` (`python -m src.generate_dataset experiment=<id>`):
+On first `generate` (`python -m synth_setter.cli.generate_dataset experiment=<id>`):
 
 1. Hydra composes the experiment against `configs/dataset.yaml`, yielding an `OmegaConf` `DictConfig`.
 2. `spec_from_cfg(cfg)` flattens the composed groups and constructs a Pydantic `DatasetSpec` (`strict=True`, `frozen=True`) in one shot — the same model used for the on-R2 artifact.
@@ -1515,7 +1515,7 @@ configs/
 | **Lifecycle marker**       | Empty file in `metadata/workers/shards/shard-{id}/` named `{worker_id}-{attempt}.{state}`. Three commit points: `.rendering` (attempt started), `.valid` (staged shard committed), `.promoted` (canonical shard committed). Plus `.invalid` (validation failed). Presence is the state — no content to parse.                                                                                                                                                                                          |
 | **Quarantined shard**      | A corrupt shard uploaded by the worker to `metadata/workers/shards/shard-{id}/quarantine/` on validation failure. Preserves the evidence for debugging alongside lifecycle markers.                                                                                                                                                                                                                                                                                                                    |
 | **Dataset card**           | JSON file (`dataset.json`) describing the finalized dataset: provenance, structure, stats. References the spec by SHA-256.                                                                                                                                                                                                                                                                                                                                                                             |
-| **param_spec**             | Configuration selecting which synthesizer parameters to vary. Determines prediction task dimensionality. Registered specs live in `param_specs` in [`src/data/vst/__init__.py`](../../src/data/vst/__init__.py); see also the [glossary entry](../glossary.md).                                                                                                                                                                                                                                        |
+| **param_spec**             | Configuration selecting which synthesizer parameters to vary. Determines prediction task dimensionality. Registered specs live in `param_specs` in [`src/synth_setter/data/vst/__init__.py`](../../src/synth_setter/data/vst/__init__.py); see also the [glossary entry](../glossary.md).                                                                                                                                                                                                              |
 | **VST**                    | Virtual Studio Technology — plugin format for audio synthesizers. Surge XT is the VST used for rendering.                                                                                                                                                                                                                                                                                                                                                                                              |
 | **Mel spectrogram**        | Frequency-domain audio representation used as neural network input. 128 mels, ~100 frames/sec.                                                                                                                                                                                                                                                                                                                                                                                                         |
 | **Fully parallel**         | Workload where tasks are completely independent — no communication or shared state between workers.                                                                                                                                                                                                                                                                                                                                                                                                    |
