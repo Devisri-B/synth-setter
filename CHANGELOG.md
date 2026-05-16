@@ -1,6 +1,660 @@
 # CHANGELOG
 
 
+## v5.1.0 (2026-05-16)
+
+### Chores
+
+- Clean up docstrings, introduce pydoclint baseline + extend ruff D-family rules
+  ([#1044](https://github.com/tinaudio/synth-setter/pull/1044),
+  [`2ec972a`](https://github.com/tinaudio/synth-setter/commit/2ec972aafdd2829f8a59b369277a27ab6164a3e9))
+
+* chore(ci): introduce pydoclint baseline + extend ruff D-family rules
+
+Closes the P6 silent-skip lane in the pydoclint hook and raises the must-have-docstring bar — both
+  items came out of the adversarial-probe replay tracked on #938.
+
+P6 fix - Generate .pydoclint-baseline.txt with the 1,935 pre-existing violations pinned by (file,
+  function, rule code). - Shrink [tool.pydoclint].exclude back to infra-only (.git, .venv, build/,
+  dist/, node_modules/, .claude/, .worktrees/, notebooks/, tests/fixtures/). - Set baseline +
+  auto-regenerate-baseline=false so the file changes only on demand via a PR diff that reviewers can
+  audit.
+
+Outcome: every formerly-excluded file is now linted. Existing violations are grandfathered; a new
+  function with a broken docstring in any file fails the hook. Verified by smoke-testing a
+  deliberately broken function added to src/synth_setter/cli/eval.py (was silently skipped before;
+  now fails DOC101/DOC103).
+
+D-family bar - Extend [tool.ruff.lint].select with D100 (missing module docstring), D101 (missing
+  class docstring), D205 (blank line between summary and description), D401 (imperative-mood
+  summary). - Add the missing module/class docstrings across 60 files. No per-file-ignores added —
+  the rules are *enforced*, not suppressed. - 2 D401 noqa entries in tools/docker_entrypoint.py on
+  placeholder command stubs.
+
+Baseline grew from initial generation (1,935 rows) to final state (2,042 rows) because the new D101
+  class docstrings activate pydoclint's allow-init-docstring path on __init__ methods, surfacing
+  previously latent arg-doc mismatches. Those mismatches are pre-existing; the chunked cleanup plan
+  in #938 unwinds them via baseline-row deletions.
+
+Verification - pre-commit run --all-files: green. - ruff check src/ tests/ scripts/: 0 errors. -
+  pytest -m "not slow and not gpu and not mps and not requires_vst": 693 passed, 5 skipped. -
+  pydoclint smoke test: new broken function in formerly-excluded file fails DOC101/DOC103 (exit 1).
+
+Refs #938 Part of #27
+
+* chore(ci): rewrite D205-bisected docstrings as self-contained sentences
+
+The mechanical D205 fix in this PR inserted blank lines mid-sentence in ~85 docstrings across src/
+  and tests/, producing ungrammatical "summary" fragments (e.g. `"...into a." / "PredictionRef."`)
+  that pass the rule but are unreadable. Rewrite each as a real single-sentence imperative summary,
+  demoting elaboration to a proper body paragraph after a blank line.
+
+Also addresses Copilot review feedback on this PR:
+
+- pyproject.toml: inline-document `auto-regenerate-baseline = false` posture and the
+  `tests/fixtures/` exclude-list rationale (comments #7, #8). -
+  src/synth_setter/models/ksin_flow_matching_module.py: reword Pooladian URL to avoid
+  trailing-period URL-fragment ambiguity (comment #9). -
+  src/synth_setter/models/components/residual_mlp.py: disambiguate `ConditionalResidualMLP` summary
+  from `VectorField` (comment #10). - src/synth_setter/models/components/{transformer,vae}.py,
+  src/synth_setter/utils/callbacks.py, src/synth_setter/evaluation/compute_audio_metrics.py: fix
+  bisected class / module docstrings (comments #1, #4, #5, #6). -
+  scripts/check_no_new_funcs_in_pydoclint_excluded.py: fix bisected module docstring (caught by an
+  AST scan, not flagged inline by Copilot).
+
+No functional code changes. pytest -m "not slow and not gpu and not mps and not requires_vst" passes
+  696/698 (2 environmental skips). Pre-commit suite green; pydoclint baseline still valid.
+
+Refs #938
+
+* chore(ci): fix residual D205 noun-phrase splits + URL-period sites
+
+Follow-up to 700af8a addressing the 6 WARNs in the /repo-review-full re-run
+  (https://github.com/tinaudio/synth-setter/pull/1044#issuecomment-4467018159):
+
+- src/synth_setter/tools/surge_xt_interactive.py:_validate_predictions — D205 noun-phrase split
+  ("the expected." / "per-sample files…"); rewritten as a self-contained summary with a real body
+  paragraph. - tests/tools/test_docker_entrypoint.py:1 (module),
+  tests/tools/test_docker_entrypoint.py:_detach_pytest_live_logging_handler,
+  tests/pipeline/test_ci/test_load_image_config.py:1 (module) — same noun-phrase split anti-pattern
+  (summary ended with article governing a body noun); summaries rewritten as complete imperative
+  sentences. - src/synth_setter/models/components/vae.py:CustomRealNVP / EncoderBlock / DecoderBlock
+  — URL trailing-period ambiguity (same defect class Copilot flagged on
+  ksin_flow_matching_module.py:243). URLs now wrapped in inline reStructuredText link syntax so the
+  trailing "." cannot be parsed as part of the URL fragment.
+
+No functional code changes. pytest fast suite: 696 passed, 2 env-skipped. Pre-commit suite green;
+  pydoclint baseline still byte-identical.
+
+* chore(ci): fix two more D205 sentence-bisections caught by Copilot re-review
+
+After 84f4a4c addressed the 6 WARNs from the /repo-review-full re-run, Copilot's post-push re-review
+  (https://github.com/tinaudio/synth-setter/pull/1044#pullrequestreview-4303703058) flagged two
+  additional sentence-bisection sites that the AST heuristic missed:
+
+- tests/tools/test_surge_xt_interactive.py:1605 (test_p_q_against_real_plugin_records_one_patch) —
+  summary ended with "records one" + blank line + "patch whose…", splitting the noun phrase "one
+  patch". Rewritten as a self-contained imperative summary with the elaboration demoted to a body
+  paragraph. - tests/pipeline/test_entrypoints/test_skypilot_launch.py:713 (under --tail rc test) —
+  summary ended with "ended in a non-" + blank line + "SUCCEEDED terminal status…", splitting the
+  hyphenated compound "non-SUCCEEDED". Rewritten as a self-contained imperative summary with the
+  explanation moved to a body paragraph.
+
+The remaining three comments in Copilot's re-review (`_validate_predictions`,
+  `test_load_image_config.py` module, `test_docker_entrypoint.py` module + fixture) were already
+  fixed in 84f4a4c — Copilot hadn't yet seen that push when it re-reviewed.
+
+No functional code changes. pytest fast suite still green.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **devcontainer**: Independent tmux sessions per terminal; install conf via post-create
+  ([#1054](https://github.com/tinaudio/synth-setter/pull/1054),
+  [`5eb3044`](https://github.com/tinaudio/synth-setter/commit/5eb30449e049346e076cceb3695366f45cd23876))
+
+- **docker**: Default devcontainer terminals to tmux with mouse mode
+  ([#1049](https://github.com/tinaudio/synth-setter/pull/1049),
+  [`c49f42a`](https://github.com/tinaudio/synth-setter/commit/c49f42acdd50168c2bf8d2bcf9313df94eae82e4))
+
+* chore(docker): default devcontainer terminals to tmux with mouse mode
+
+VS Code terminals in cpu/gpu/root_gpu devcontainers now launch tmux (attach-or-create session
+  "main") instead of bash. A bash profile is kept available for users who prefer plain shells. Mouse
+  scrolling/ selection comes from a new .devcontainer/tmux.conf loaded via tmux -f.
+
+* docs: note tmux default in getting-started and doc-map
+
+- **lint**: Clean up src/synth_setter/utils/instantiators.py
+  ([#1038](https://github.com/tinaudio/synth-setter/pull/1038),
+  [`74dde26`](https://github.com/tinaudio/synth-setter/commit/74dde261ce9ca1940315e2dd0b7bb1fa8780f56e))
+
+Add :raises TypeError: and :rtype: sections to the two public functions so the file satisfies
+  pydoclint DOC203/DOC501/DOC503, and remove the file from [tool.pydoclint].exclude in
+  pyproject.toml.
+
+No functional changes — docstring-only edits.
+
+Refs #25
+
+- **lint**: Clean up tests/helpers/run_if.py and package_available.py
+  ([#1040](https://github.com/tinaudio/synth-setter/pull/1040),
+  [`507b6b2`](https://github.com/tinaudio/synth-setter/commit/507b6b29ee40d5c2a76a7af2fd42b44150adb67f))
+
+Add the missing pydoclint return sections and align docstring arg order with the function signature,
+  then drop both files from [tool.pydoclint].exclude in pyproject.toml. Pure docstring/lint changes
+  — no behavior changes.
+
+Refs #25
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **lint**: Graduate tests/helpers/package_available.py from pydoclint exclude
+  ([#1039](https://github.com/tinaudio/synth-setter/pull/1039),
+  [`f39ebc6`](https://github.com/tinaudio/synth-setter/commit/f39ebc6d5395e2b43b68cc5c5551fd3c22873c91))
+
+PR #979 cleared this file from `.pre-commit-config.yaml`'s `pyright` exclude but left it in
+  `[tool.pydoclint].exclude` in `pyproject.toml`. Per the lint-cleanup runbook (step 5), graduating
+  a file means clearing it from *every* exclusion list it appears in.
+
+- Update `_package_available`'s docstring to use the repo's standard Sphinx return convention
+  (`:returns:` + `:rtype: bool`) so pydoclint's DOC203 (return-type consistency) is satisfied. -
+  Drop `^tests/helpers/package_available\.py$` from `[tool.pydoclint].exclude`.
+
+No source/behavioural change. `pre-commit run --files tests/helpers/package_available.py
+  pyproject.toml` is green across all hooks (ruff, ruff format, pyright, docformatter, interrogate,
+  pydoclint, codespell).
+
+Refs #25
+
+### Documentation
+
+- **lint-cleanup**: Pick most recently added exclusion-list entry first (LIFO)
+  ([#1041](https://github.com/tinaudio/synth-setter/pull/1041),
+  [`526d299`](https://github.com/tinaudio/synth-setter/commit/526d2995dccc1fcd3b4ba8726e41fdd973849a8a))
+
+* docs(lint-cleanup): pick most recently added exclusion-list entry first (LIFO)
+
+When the lint-cleanup agent is invoked without a specific target, it now works the exclusion lists
+  in reverse order of when each entry was added — most recently added first, oldest legacy entries
+  last — instead of the older "smallest file by line count" heuristic. The rule is added to the
+  canonical runbook in .github/agents/lint-cleanup.md so all three entry points (Claude Code agent,
+  slash command, Copilot Coding Agent) inherit it; the slash-command stub is updated to point at the
+  new section.
+
+Rationale (also captured in the runbook's "Why:" block): a freshly-added exclusion is almost always
+  small and context-fresh — graduating it immediately reverses tech-debt accrual before it cools.
+  Old legacy entries don't get worse by waiting another week; new ones do.
+
+Refs #25
+
+* docs(lint-cleanup): frame git blame as a best-effort heuristic; shrink slash-command stub to
+  delegation
+
+Addresses Copilot review feedback on #1041:
+
+- #discussion_r3242610687: git blame reports the last-touch commit, not the strict introducing
+  commit (a reformat or YAML reorder can move it). Reframe the ranking step as a best-effort
+  heuristic and call out explicitly that we are NOT reaching for `git log -L` / pickaxe — the extra
+  fidelity isn't worth the runtime cost or runbook complexity. If an entry looks misranked, pick the
+  next one down.
+
+- #discussion_r3242610640: the slash-command stub was paraphrasing the canonical "Picking the next
+  file" algorithm, which the runbook itself forbids (lint-cleanup.md:17 — entry-point stubs "must
+  not paraphrase or fork the workflow steps themselves"). Shrunk to a one-sentence delegation with
+  an anchor link to the section. Also harmonized the tie-break wording with the runbook ("smaller
+  file by line count", not "smaller file size").
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **lint-cleanup**: Switch workflow target from exclude-list entries to baseline rows
+  ([#1057](https://github.com/tinaudio/synth-setter/pull/1057),
+  [`d796851`](https://github.com/tinaudio/synth-setter/commit/d79685106dbf88f6c59e228118921720a5dee070))
+
+### Features
+
+- **metrics**: Add get_stats_wds for WebDataset shard directories
+  ([#1043](https://github.com/tinaudio/synth-setter/pull/1043),
+  [`55daa30`](https://github.com/tinaudio/synth-setter/commit/55daa30aa28e8330da36ccd7ae76d1af48ba1b90))
+
+### Internal-Feat
+
+- **ci**: Wds matrix axis on test-dataset-generation + ci-materialize-test-wds config
+  ([#1036](https://github.com/tinaudio/synth-setter/pull/1036),
+  [`8fded0f`](https://github.com/tinaudio/synth-setter/commit/8fded0f5b00e21f08a0377e5ad7994c62daec39d))
+
+* internal-feat(ci): wds matrix axis on test-dataset-generation + ci-materialize-test-wds config
+
+Adds `output_format: [hdf5, wds]` as a strategy.matrix axis on `test-dataset-generation.yml`'s
+  `generate-local` and `generate-launcher` jobs, plus matching propagation through the `validate`
+  job's `spec_uri` template. `CLUSTER_NAME` and the validate-side `spec_uri` are now namespaced by
+  `matrix.output_format` so the matrix cells don't collide on the launcher's R2 spec key (e.g.
+  `synth-setter-smoke-skypilot-local-wds-<run_id>-<run_attempt>`).
+
+Adds a sibling Hydra experiment config
+  `configs/experiment/generate_dataset/ci-materialize-test-wds.yaml` mirroring
+  `ci-materialize-test.yaml`'s render volume (96 samples → 3 shards at batch_per_shard=32) but with
+  `output_format: wds`, so the wds matrix cell has a dedicated experiment to compose against.
+
+Adds `tests/infra/test_dataset_generation_matrix.py` to pin the matrix shape (TDD red-then-green):
+  asserts both generate jobs declare the `output_format` axis, cluster_name and spec_uri interpolate
+  `matrix.output_format`, and `setup` emits an `output_formats` output containing both `hdf5` and
+  `wds`.
+
+The wds writer is `synth_setter.data.vst.writers.make_wds_dataset` (landed in #1030); the wds
+  validator's tar branch lands in PR-E. Until PR-E merges to main, this PR's wds matrix row will
+  fail at validate-shards.
+
+Refs #874
+
+* internal-fix(ci): unblock code-quality guard on new tests/infra file
+
+`tests/infra/test_dataset_generation_matrix.py` is a new file under `tests/infra/`, which previously
+  matched a broad `^tests/infra/` exclude in `[tool.pydoclint].exclude`. The `code-quality`
+  workflow's `check_no_new_funcs_in_pydoclint_excluded.py` guard treats any pydoclint exclude as a
+  one-way ratchet — new defs can be added only to files not in the exclude — so the guard failed on
+  the matrix-pin test's six new defs.
+
+Narrows the `^tests/infra/` entry to per-file regexes for the existing five test modules + conftest,
+  so the new test file is covered by pydoclint going forward. Adds sphinx-style `:param:` /
+  `:returns:` / `:raises:` docstrings to satisfy DOC101/DOC201/DOC501 on every def in the new file.
+
+No behavioral change — the workflow YAML, the experiment config, and the assertions in the test are
+  unchanged. Only docstrings and the pydoclint exclude regex.
+
+* internal-fix(ci): collapse wds matrix to dispatched format on workflow_dispatch
+
+On `workflow_dispatch`, both `hdf5` and `wds` matrix cells resolved `DATASET_CONFIG` to the same
+  `inputs.dataset_config` value. Any single experiment config hardcodes one `output_format`, so the
+  cell whose `matrix.output_format` didn't match the dispatched config's hardcoded format
+  deterministically failed the new "Validate spec exists and matches matrix output_format" check.
+
+Restructure `setup.matrix` to compose the dispatched config with Hydra and emit
+  `output_formats=[<that format>]` on `workflow_dispatch`. The `pull_request` path is unchanged — it
+  still expands to both rows because the workflow pins a per-format experiment config for each
+  (`smoke-shard` for hdf5, `ci-materialize-test-wds` for wds). Move the `Install Hydra` step above
+  `matrix` so the same Hydra install services both `matrix` (new extraction) and `bucket` (existing
+  extraction).
+
+Also set `sample_batch_size: 32` explicitly in `ci-materialize-test-wds.yaml` to match
+  `smoke-shard.yaml`'s explicit-declaration style — the value coincides with the `surge_xt`
+  render-group default, but pinning it in the config makes the batching shape readable without
+  chasing the inheritance.
+
+* internal-fix(ci): pin test-act real-run to a single matrix cell
+
+PR-G's `output_format: [hdf5, wds]` matrix expansion broke the `Verify act parses repo + builds
+  runner image` regression guard. Act runs every matrix cell against the same act-runner container,
+  so the parallel `actions/setup-python@v6` invocations from `hdf5` and `wds` race on the shared
+  `/opt/hostedtoolcache/Python` cleanup hook — both fail with `Directory not empty` / `cd: bin/: No
+  such file or directory`.
+
+Real GHA gives each matrix cell its own VM, so this is purely an act limitation, not a workflow bug.
+
+Pins the act real-run to `--matrix output_format:hdf5` so the regression guard exercises one matrix
+  cell at a time. The per-cell validate-shards behavior itself is exercised by real GHA on every PR
+  (`generate_dataset (skypilot-local / hdf5)` and `(skypilot-local / wds)` in the
+  test-dataset-generation workflow), so coverage isn't lost.
+
+* internal-fix(ci): harden setup.matrix DISPATCH_FORMAT extraction + if-guards
+
+Two robustness fixes to PR-G's setup-matrix step, from #1036 review:
+
+1. `DISPATCH_FORMAT` was captured from the inline Python script's raw stdout. Any banner /
+  deprecation notice that Hydra (or a transitively imported library) prints during `compose()` would
+  be prepended to the captured value, breaking the `output_formats="[\"${DISPATCH_FORMAT}\"]"` JSON
+  literal and the downstream `fromJSON(...)` matrix expansion.
+
+Use `sys.stdout.write(cfg.output_format)` (so we never carry a trailing newline that could mask a
+  multi-line stdout) and pipe stderr to /dev/null, then `tail -n 1` to defensively pick only the
+  final line. End-to-end probe with the dispatched wds experiment still resolves to `wds`.
+
+2. The `generate-local`, `generate-launcher`, and `validate` jobs' `if:` guards check `providers* !=
+  '[]'` but not `output_formats != '[]'`. Today the two are coupled in setup.matrix (output_formats
+  is '[]' only when providers is '[]'), but the guards don't enforce that. Add the explicit
+  `output_formats != '[]'` clause to all three so a future decoupling fails loud instead of silently
+  fanning out to zero cells.
+
+* test(ci): pin three event-name branches in setup.matrix bash logic
+
+Addresses Copilot's PR-#1036 review concern about untested branching in setup.matrix's run-script
+  (review comment #3238090866).
+
+The existing `test_setup_emits_output_formats_with_both_rows` only asserts the pull_request branch's
+  literal. The new `test_setup_matrix_step_branches_on_event_name` additionally pins:
+
+1. `providers == '[]'` short-circuit → `output_formats='[]'` 2. pull_request →
+  `output_formats='["hdf5","wds"]'` 3. workflow_dispatch → composes DISPATCH_DATASET_CONFIG via
+  Hydra and assigns `output_formats="[\\"${DISPATCH_FORMAT}\\"]"`
+
+A future edit that drops or rewrites any one branch flips the test red immediately, so the
+  dispatch-path drift Copilot was worried about surfaces at PR-time rather than on the first
+  workflow_dispatch run.
+
+* internal-fix(ci): use smoke-shard volume for PR-time wds matrix row
+
+The wds matrix cell in PR-G's latest CI run timed out at the generate-dataset-shards reusable's
+  20-min step limit (28-min job elapsed before SIGKILL). PR-G's wds row pinned to
+  `ci-materialize-test-wds` (96 samples / 3 shards at batch_per_shard=32), which renders ~8x more
+  audio than the hdf5 row's `smoke-shard` (12 samples / 3 shards at batch_per_shard=4). On a kind
+  cluster's single-CPU runner that's well over the 20-min budget.
+
+Drop in a sibling `smoke-shard-wds.yaml` that mirrors `smoke-shard.yaml`'s render volume + batching
+  shape exactly, differing only in `output_format: wds`, and pin the workflow's PR-time wds matrix
+  row to this. The two PR-time matrix cells now differ only in format — easier apples-to-apples
+  regression comparison. The larger `ci-materialize-test-wds.yaml` stays around for
+  workflow_dispatch coverage where the step timeout is moot.
+
+The wds row's validate-shards step still fails by design until PR-E (#1035, the tar-branch
+  validator) merges — see PR body.
+
+* test(ci): add smoke-shard-wds to DATASET_EXPERIMENTS allowlist
+
+`smoke-shard-wds.yaml` was added in 7fc81ba but the allowlist in
+  tests/pipeline/test_configs/test_experiment_yamls.py was not updated to match — the file's
+  docstring requires a new entry for every new datagen experiment under
+  configs/experiment/generate_dataset/ so the validates-as-DatasetSpec + JSON-round-trip sweep
+  covers it. Pinning it here surfaces any future Pydantic-schema drift on that config the same way
+  it does for the existing entries.
+
+* internal-fix(ci): surface Hydra stderr + document infra lint convention
+
+- Capture stderr to a tempfile around the workflow_dispatch Hydra-compose so a compose failure
+  (missing experiment, missing `output_format`, etc.) surfaces the traceback in the action log
+  instead of dropping to a bare exit-1. Pipeline still uses `set -euo pipefail` for fail-fast
+  behaviour. - Add a pydoclint-exclude regex comment documenting that the per-file tests/infra/
+  entries replaced the blanket `^tests/infra/` exclusion and new files under that directory are
+  subject to pydoclint by default.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **pipeline**: Inner-shape checks in validate_shard
+  ([#1029](https://github.com/tinaudio/synth-setter/pull/1029),
+  [`da1327b`](https://github.com/tinaudio/synth-setter/commit/da1327b625362cc1639518650075b3fe4572c8e9))
+
+* internal-feat(vst): promote writer shape helpers + DATASET_FIELD_NAMES to public
+
+Promote the per-row array names and the audio/mel/param shape calculators inside
+  synth_setter.data.vst.generate_vst_dataset to public module-level helpers (DATASET_FIELD_NAMES,
+  audio_dataset_shape, mel_dataset_shape, param_array_dataset_shape) plus the mel-front-end
+  constants and mel_hop_length / mel_n_fft / mel_n_frames helpers. make_spectrogram and
+  create_datasets_and_get_start_idx now call the new helpers; behavior is byte-identical for the
+  existing render configs.
+
+Foundation for the upcoming WDS writer and shard-validator inner-shape checks, which need to share
+  these primitives with the validator side.
+
+Refs #874 Refs #882
+
+* internal-fix(vst): extract shape primitives to shapes.py to clear code-quality guard
+
+The first commit added six new top-level helpers (DATASET_FIELD_NAMES, mel_hop_length, mel_n_fft,
+  mel_n_frames, audio_dataset_shape, mel_dataset_shape, param_array_dataset_shape) and four
+  module-level constants to src/synth_setter/data/vst/generate_vst_dataset.py, which is on the
+  [tool.pydoclint].exclude list — and the code-quality CI guard
+  (scripts/check_no_new_funcs_in_pydoclint_excluded.py, see #938) rejects any new top-level def in
+  an excluded file. The preferred fix is to remove the source file from the exclude list, but
+  generate_vst_dataset.py has 12+ pre-existing pydoclint violations on neighbouring functions
+  (make_spectrogram, generate_sample, make_dataset, _GenerateCliArgs) — all out of scope for this
+  foundation PR.
+
+Move the new helpers to a fresh sibling module src/synth_setter/data/vst/shapes.py that was never on
+  the exclude list, so pydoclint runs on it from day one and the guard sees the new defs land in an
+  unexcluded file. generate_vst_dataset.py now imports the primitives from the new module; behaviour
+  is unchanged.
+
+Also addresses the doc-drift advisory on the misleading "single source of truth for the shard
+  validator" comment — the comment now lives in shapes.py's module docstring and hedges the
+  validator/wds writer consumers as "(planned)" since validate_shard.py still has its own private
+  _EXPECTED_DATASETS tuple.
+
+Refs #874 Refs #882 Refs #938
+
+* internal-fix(vst): wire DATASET_FIELD_NAMES into the writer's HDF5 dataset names
+
+Copilot review on PR #1025 flagged the prior "single source of truth" comment on DATASET_FIELD_NAMES
+  as overpromising: save_samples and create_datasets_and_get_start_idx still hard-coded "audio",
+  "mel_spec", "param_array" as string literals, so the constant was orthogonal to the writer. The
+  first follow-up commit (a2376d0) addressed half of that by moving the constant to shapes.py and
+  softening the comment.
+
+This commit takes the other half — actually making the constant load-bearing on the writer side:
+
+- shapes.py exposes per-field constants AUDIO_FIELD, MEL_SPEC_FIELD, PARAM_ARRAY_FIELD and builds
+  DATASET_FIELD_NAMES from them, so the tuple stays a derived view of the per-field constants. -
+  create_datasets_and_get_start_idx now passes AUDIO_FIELD / MEL_SPEC_FIELD / PARAM_ARRAY_FIELD into
+  create_dataset instead of the bare string literals. - A new shape-helpers test pins
+  DATASET_FIELD_NAMES == (AUDIO_FIELD, MEL_SPEC_FIELD, PARAM_ARRAY_FIELD) and the literal triple so
+  renaming any field still forces the validator's expected tuple to update in lockstep.
+
+save_samples doesn't reference dataset names (it operates on already-created h5py.Dataset handles),
+  so no change there.
+
+* internal-fix(vst): pass center=True explicitly to make_spectrogram's librosa call
+
+The shape helpers in shapes.py (mel_n_frames) document the librosa center=True framing assumption,
+  but make_spectrogram relied on the implicit librosa default. Pinning center=True keeps the writer
+  and the (planned) shard validator aligned on the same framing if librosa ever changes its default.
+
+Refs #1025.
+
+* internal-feat(pipeline): inner-shape checks in validate_shard
+
+Tightens validate_shard's HDF5 path so every dataset's full ``.shape`` is checked against the
+  writer's source-of-truth shape helpers in ``synth_setter.data.vst.shapes`` — not just
+  ``shape[0]``. The validator now uses ``DATASET_FIELD_NAMES`` directly (deleting the private
+  _EXPECTED_DATASETS mirror) and the new ``_expected_dataset_shapes`` helper to derive ``(N, C,
+  time)`` for audio, ``(N, C, n_mels, n_frames)`` for mel, and ``(N, num_params)`` for the param
+  array.
+
+A renderer change that drifts the audio / mel / param shapes now fails fast at validate time instead
+  of silently shipping mis-shaped shards downstream to training.
+
+HDF5-only; the wds tar branch is PR-E in the WDS port roadmap.
+
+* chore(pipeline): remove validate_shard from pydoclint excludes
+
+The previous commit added _expected_dataset_shapes() to validate_shard.py while that file was on
+  [tool.pydoclint].exclude — tripping the check_no_new_funcs_in_pydoclint_excluded guard. The
+  guard's preferred remediation is to remove the file from the excludes list, which means making it
+  pydoclint-clean.
+
+Add sphinx :param: / :returns: sections to _expected_dataset_shapes, validate_shard, _load_spec, and
+  validate_all_shards_from_r2, then drop validate_shard.py from the exclude list. Tightens lint
+  coverage as a side benefit of the inner-shape work.
+
+* docs(design): update validate_shard description to match inner-shape checks
+
+After #1029 (this PR), validate_shard asserts the full per-dataset .shape against the writer's shape
+  helpers from synth_setter.data.vst.shapes, not just shape[0] row counts. Updates the file-tree
+  comment in data-pipeline.md to match.
+
+Picks up the post-PR doc-drift advisory.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **pipeline**: Validate_shard tar branch + EXTENSION_TO_OUTPUT_FORMAT dispatch
+  ([#1035](https://github.com/tinaudio/synth-setter/pull/1035),
+  [`e59037b`](https://github.com/tinaudio/synth-setter/commit/e59037b37802cf939899aacee408979497d56ae4))
+
+* internal-feat(pipeline): validate_shard tar branch + EXTENSION_TO_OUTPUT_FORMAT dispatch
+
+Add the .tar/wds branch to synth_setter.pipeline.ci.validate_shard so the worker-side validator
+  handles wds shards alongside the existing HDF5 path. Dispatch is by file suffix via
+  EXTENSION_TO_OUTPUT_FORMAT (introduced in PR-A). The tar path validates metadata.json presence +
+  strict ShardMetadata parse, every <batch_key>.<field>.npy member loads as a numpy array whose
+  trailing dims match the writer's shape helpers in synth_setter.data.vst.shapes, and each field's
+  summed row count across batches equals spec.render.batch_per_shard. An unsupported suffix returns
+  a clear error naming the supported set.
+
+Refs #874 Refs #882
+
+* internal-fix(pipeline): harden validate_shard tar branch against malformed members and misaligned
+  batches
+
+Address Copilot review findings on #1035:
+
+- Tighten tar member name parsing to strict regex `^(\d{8})\.<field>\.npy$`. Previously
+  `rpartition(".")` would accept `audio.npy` or `foo.audio.npy` and bucket them into the audio field
+  even though the writer never emits such names. Malformed names now surface a targeted error. - Add
+  per-batch-key consistency check. The writer's invariant is that every batch key has one `.npy` per
+  `DATASET_FIELD_NAMES` and all three share the same row count. A tar whose per-field row sums match
+  `batch_per_shard` but whose within-batch row counts diverge would produce misaligned WebDataset
+  samples — validator now catches both the missing-field-within-batch and row-count-mismatch cases.
+  - Harden `_load_npy_member` against `NpzFile` and 0-d scalars. `np.load` can resolve to an
+  `NpzFile` (for `.npz` bytes saved under a `.npy` name) or a 0-d ndarray with no row dim. Both
+  would crash the per-batch `arr.shape[0]` / `arr.shape[1:]` accesses with an opaque traceback. Now
+  returns a targeted validation error.
+
+Five new tests pin each behavior: malformed-member-name rejection, within-batch row-count mismatch,
+  batch-key-missing-field, NpzFile under .npy name, and 0-d scalar payload.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+- **vst**: Split make_dataset into make_hdf5_dataset + make_wds_dataset; dispatch CLI by suffix
+  ([#1030](https://github.com/tinaudio/synth-setter/pull/1030),
+  [`9cf790f`](https://github.com/tinaudio/synth-setter/commit/9cf790ffd1e8700ad28d4de8a0a6e38b53ded6b5))
+
+* internal-feat(vst): split make_dataset into make_hdf5_dataset + make_wds_dataset; dispatch CLI by
+  suffix
+
+Splits the single legacy ``make_dataset(h5py.File, render_cfg)`` into two writer entrypoints
+  dispatched by the renderer CLI on the output file's suffix:
+
+- ``make_hdf5_dataset(hdf5_file: Path | str, render_cfg, ...)`` — keeps the resumable HDF5 path;
+  signature changes to take a path and open the file internally. Writes the ``audio.attrs`` sidecar
+  from a new ``ShardMetadata`` instance. - ``make_wds_dataset(wds_file: Path | str, render_cfg,
+  ...)`` — new wds path using ``webdataset.TarWriter``. Emits per-batch ``.npy`` members plus a
+  ``metadata.json`` member from the same ``ShardMetadata`` instance.
+
+Both paths share rendering logic via ``_validate_fixed_params_lengths`` /
+  ``_generate_sample_for_index`` / ``_shard_metadata_from_render`` / ``_render_in_batches`` helpers.
+  The new writer helpers live in a fresh ``synth_setter.data.vst.writers`` module so the
+  code-quality guard (#938) stays green without docstring-cleaning the legacy parts of
+  ``generate_vst_dataset.py``.
+
+CLI ``main`` in ``generate_vst_dataset.py`` dispatches by ``Path(args.data_file).suffix`` via
+  ``EXTENSION_TO_OUTPUT_FORMAT`` (``.h5`` → HDF5, ``.tar`` → wds, unknown → ``SystemExit``).
+
+Updates the one in-tree caller (``tools/surge_xt_interactive.py``) to the new path-accepting
+  signature. Drops the stale "HDF5-only" docstring claims from ``cli/generate_dataset.py``.
+
+Refs #874 Refs #882
+
+* docs(design,guides): sweep stale make_dataset refs after writer split
+
+Post-#1030 doc-drift cleanup. The PR renames make_dataset → make_hdf5_dataset + adds
+  make_wds_dataset, and lifts both into a new synth_setter.data.vst.writers module. This commit
+  ports the docs over.
+
+* docs/design/data-pipeline.md: - Fix broken import example (was `from ...generate_vst_dataset
+  import make_hdf5_dataset` → now `from ...writers import make_hdf5_dataset`). - Rename
+  `make_dataset()` / `make_dataset` in §7.8.1 spawn-rationale prose. - Rewrite §7.10 head paragraph
+  and the "Why generation stays HDF5" sub-section: workers now emit the format selected by the spec;
+  the "design in transition" Note that pointed at PR-13 is replaced by a factual HDF5-is-resumable /
+  WDS-is-not paragraph since PR-13 has landed. - Fix stale src/pipeline/schemas/shard_metadata.py
+  path (post-#1001 layout) at line 863. * docs/design/data-pipeline-implementation-plan.md — three
+  make_dataset / generate_vst_dataset import refs renamed to make_hdf5_dataset / writers. *
+  docs/reference/audio-similarity-benchmarks.md — two prose refs to make_dataset renamed to
+  make_hdf5_dataset. * docs/guides/surge-xt-interactive.md — seven refs renamed; module path on the
+  symbol-link swapped from generate_vst_dataset.py to writers.py. * docs/doc-map.yaml — retarget the
+  surge-xt-interactive generate_vst_dataset.py entry to its remaining surface (generate_sample /
+  VSTDataSample / make_spectrogram) and add new writers.py + shapes.py entries under both the
+  data-pipeline design doc and the surge-xt-interactive guide.
+
+* internal-fix(vst): address Copilot review nits on PR #1030
+
+- Drop the unused `from synth_setter.data.vst import param_specs` import in test_writers_wds_e2e.py
+  — would trip ruff F401. - Rewrite the stale "Inlined here to avoid a cross-test import dependency"
+  comment that contradicted the actual import-from-sibling-test pattern. - Narrow
+  `pytest.raises(Exception, ...)` → `pytest.raises(pydantic.ValidationError, ...)` in
+  test_make_wds_dataset_metadata_json_strict_rejects_extra so the test actually pins the
+  `extra="forbid"` behavior its docstring promises. - Rename three test functions in
+  test_generate_vst_dataset.py from `test_make_dataset*` → `test_make_hdf5_dataset*` to match the
+  post-split public entrypoint name (better for grep/test selection).
+
+* internal-fix(vst): address Copilot follow-ups on PR #1030
+
+- Drop unused hashlib and random imports from generate_vst_dataset.py (left over after the writer
+  split — would have failed ruff F401 once the file isn't pydoclint-excluded). - Correct the
+  WebDataset shard-structure snippet in the data-pipeline design doc: real members are
+  <start_idx:08d>.<audio|mel_spec|param_array>.npy (per DATASET_FIELD_NAMES + save_wds_samples),
+  each holds a whole batch stacked on axis 0, and keys advance by sample_batch_size.
+
+Refs #874
+
+* chore(lint): remove test_generate_vst_dataset.py from pydoclint excludes
+
+The 254c534 rename of three tests (test_make_dataset* → test_make_hdf5_dataset*) in
+  tests/data/vst/test_generate_vst_dataset.py registers as new top-level defs in the diff against
+  main, which trips the check_no_new_funcs_in_pydoclint_excluded guard (#938).
+
+The file is already lint-clean: 0 missing arg annotations, only 1 missing docstring on a nested
+  `fake_sample` closure — added a one-liner.
+
+Drop the file from [tool.pydoclint].exclude. pydoclint now runs against it and exits clean.
+
+Refs #25 Refs #874
+
+* revert(vst): keep test_make_dataset names to satisfy code-quality guard
+
+The 254c534 rename of three tests in test_generate_vst_dataset.py (`test_make_dataset` ->
+  `test_make_hdf5_dataset` and friends) was a Copilot polish suggestion but tripped the
+  check_no_new_funcs_in_pydoclint_excluded guard (#938) — the diff against main shows them as new
+  top-level defs, and the file is on [tool.pydoclint].exclude.
+
+The previous attempted fix (remove the file from the exclude list) silently failed locally because
+  the `pre-commit run` output was piped through `tail -8`, which truncated pydoclint's 13+
+  DOC101/DOC103 violations on pytest-fixture-args (`tmp_path`, `monkeypatch`) — those docstrings
+  would all need `:param:` sections to clear pydoclint, which is out of scope for this PR.
+
+Reverting just the three function names; the docstrings already say "make_hdf5_dataset" so future
+  maintainers know the function under test.
+
+- writers.py: tighten fixed_*_params_list validation from len() < to len() != expected_fixed_len.
+  The writer indexes fixed params by ``i - start_idx``, so a shard-length list on a resumed run
+  (start_idx > 0) would silently shift indices (row start_idx using list[0]). Exact-equality catches
+  that mismatch at validation time instead of letting it through. Existing too-short test still
+  matches via the "fixed_synth_params_list has length" prefix. - writers.py: rewrite
+  make_hdf5_dataset / make_wds_dataset / _validate_fixed_params_lengths docstrings to spell out the
+  tail-only contract on resumed runs (list[0] lands at row start_idx, caller slices a full-length
+  list themselves), so the indexing semantics are visible at the public API surface. -
+  generate_vst_dataset.py: rewrite the main() lazy-import rationale — h5py is already a module-level
+  import here, so it is not what the lazy load defers; only webdataset is.
+
+* Update writers.py
+
+* docs(claude-md): point doc-map's dispatch-maps covers at the actual dispatcher
+
+Copilot review on PR #1030 flagged that the doc-map.yaml line 85 entry for spec.py says the
+  suffix-dispatch maps are consumed by "the renderer CLI's main() in writers.py", but the dispatch
+  actually lives in data/vst/generate_vst_dataset.py::main() (which imports
+  EXTENSION_TO_OUTPUT_FORMAT, reads Path(data_file).suffix, and routes to writers.make_hdf5_dataset
+  or writers.make_wds_dataset).
+
+Update the covers text to point at the correct module and spell out the lookup so future doc-drift
+  checks anchor on the right symbol.
+
+---------
+
+Co-authored-by: Managed via Tart <admin@Manageds-Virtual-Machine.local>
+
+### Refactoring
+
+- **pipeline**: Rename RenderConfig samples_per_{shard,render_batch}
+  ([#1056](https://github.com/tinaudio/synth-setter/pull/1056),
+  [`2686160`](https://github.com/tinaudio/synth-setter/commit/2686160f4f3b0cd0e65ba669f8f7edeb4e840a31))
+
+
 ## v5.0.1 (2026-05-13)
 
 ### Bug Fixes
