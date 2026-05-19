@@ -1,6 +1,146 @@
 # CHANGELOG
 
 
+## v5.6.0 (2026-05-19)
+
+### Chores
+
+- **dev**: Drop obsolete [toml] extra from pytest-cov spec
+  ([#1152](https://github.com/tinaudio/synth-setter/pull/1152),
+  [`d6b8ccf`](https://github.com/tinaudio/synth-setter/commit/d6b8ccf2ab66cf207b66d5f94a25569721915657))
+
+pytest-cov 7.x folded the optional `[toml]` extra (which added `tomli`/`tomllib` to support
+  `pyproject.toml`-based `[tool.coverage]` config) into the base package, so `pytest-cov[toml]` now
+  emits `WARNING: pytest-cov 7.1.0 does not provide the extra 'toml'` during pip resolution. Drop
+  the suffix — coverage behavior is unchanged.
+
+Stacked on #1147, which is where the `pytest-cov` entry was added to the dev extras.
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Features
+
+- **pipeline**: Workflows consume canonical spec_uri; delete upload_spec_to_r2 +
+  LAUNCHER_SPEC_R2_PREFIX ([#1150](https://github.com/tinaudio/synth-setter/pull/1150),
+  [`7fe0061`](https://github.com/tinaudio/synth-setter/commit/7fe00619ab4896d0d84446412e4df8fc470a91ff))
+
+* feat(pipeline): workflows consume canonical spec_uri; delete upload_spec_to_r2 +
+  LAUNCHER_SPEC_R2_PREFIX
+
+Closes #385 (input_spec.json R2 path divergence from storage-provenance-spec).
+
+- Delete skypilot_launch.upload_spec_to_r2() and both call sites (main() and dispatch_via_skypilot's
+  legacy block). dispatch_via_skypilot's WORKER_SPEC_URI assignment is now sourced from its spec_uri
+  kwarg only. - Delete LAUNCHER_SPEC_R2_PREFIX from pipeline/constants.py. -
+  test-dataset-generation.yml validate job consumes ${{ needs.generate-launcher.outputs.spec_uri }}
+  instead of a hand-built transport-key URI. Header and interim comments rewritten accordingly. -
+  Sweep stale references to the launcher transport copy across workflows
+  (generate-dataset-shards.yaml, test-skypilot-debug.yml, validate-dataset-shards.yaml), docs
+  (storage-provenance-spec.md §3a, configuration-reference.md, github-actions.md, doc-map.yaml), and
+  tests (test_skypilot_launch.py, test_ci/test_spec_uri.py, test_schemas/test_r2_location.py,
+  test_dataset_generation_matrix.py). - Drop the four upload_spec_to_r2 pydoclint baseline rows.
+
+CHANGELOG.md is intentionally untouched (historical record).
+
+Known limitation (not in scope for this PR): the validate job consumes a matrix'd reusable
+  workflow's output via needs.X.outputs.Y; GitHub Actions returns the last-finishing matrix cell's
+  value to all downstream cells. Proper per-cell pairing requires a fan-in job (follow-up).
+
+Refs #603 Refs #1110 (external prereq, already merged as 08f320c) Part of
+  workflow-spec-upload-delegation series
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* fix(pipeline): skypilot_launch.main() uploads canonical spec via spec_io.upload_spec
+
+Previously main() set WORKER_SPEC_URI to spec.r2.input_spec_uri() but never uploaded the spec to
+  that URI on the debug entrypoint, leaving validate-spec / worker-side fetchers pointed at a
+  non-existent R2 object. Mirror the production path in cli/generate_dataset.py::main() by calling
+  upload_spec() before forwarding the URI. RCLONE_CONFIG_R2_* are already exported to os.environ
+  earlier in main(), so the rclone copyto inherits them.
+
+Adds an autouse upload_spec stub to the launcher's test fixtures and a behavioral test asserting the
+  launcher uploads before dispatch. Also updates the configuration-reference doc to describe the
+  now-symmetric upload sites.
+
+Addresses Copilot review comments on PR #1150: - #discussion_r3268882093 (main() WORKER_SPEC_URI
+  points to non-existent object) - #discussion_r3268882195 (doc claimed launcher uploads, it didn't)
+  - #discussion_r3268882242 (workflow comment referenced spec_io.upload_spec but launcher didn't
+  call it — true after this commit)
+
+* docs(github-actions): note matrix-pairing limitation on validate spec_uri
+
+Copilot review on PR #1150 flagged that the artifact-chains bullet on
+  docs/reference/github-actions.md L87 reads as if validate matrix cells get per-cell pairing of
+  spec_uri, but GitHub Actions exposes only one scalar through needs.<matrix-job>.outputs.<x>.
+  Annotate the bullet with the known limitation and link to the tracking issue (#1154).
+
+* fix(pipeline): emit spec_uri with the same run_id that was uploaded
+
+The `Compute spec_uri output` step in generate-dataset-shards.yaml was reading
+  `${RUN_METADATA_DIR}/input_spec.json`, which was produced by an upfront `materialize_spec` call.
+  That call generates a fresh run_id timestamp every time it runs, and
+  `synth-setter-generate-dataset` then generates *another* fresh run_id when it materializes +
+  uploads the canonical spec to R2. The resulting workflow output `spec_uri` therefore pointed at a
+  run_id that did NOT exist in R2, and downstream `validate-dataset-shards` cells failed with
+  `FileNotFoundError: [Errno 2] No such file or directory: '/tmp/<tmp>/input_spec.json'` (rclone
+  copyto of a missing key produced no local file).
+
+Surfaced on PR #1150 / CI run 26120090612 — both skypilot-local validate cells (hdf5 + wds) failed
+  at validate-spec and validate-shards. Generation itself succeeded; only the URI emitted to the
+  downstream consumer was wrong.
+
+Fix: drop the upfront `materialize_spec` call from both rows (skypilot-local and runpod/oci). After
+  `synth-setter-generate-dataset` runs, copy the canonical
+  `data/<task>/<run>/metadata/input_spec.json` it wrote into `${RUN_METADATA_DIR}/input_spec.json`
+  so the downstream `Compute spec_uri output` step emits a URI with the run_id that was actually
+  uploaded. The run-metadata debug artifact is preserved.
+
+The pre-existing matrix-cell-pairing limitation (tracked in #1154) is orthogonal: even with the
+  wrong-cell pairing, both cells would now point at a URI that *does* exist in R2; the only
+  remaining concern is that a validate cell may consume the other cell's matching spec. That's still
+  benign for `validate-spec` (structural validation is dataset-agnostic) and the shards-validate may
+  surface a count-mismatch, but no longer a 404.
+
+Refs #603 Refs #1154
+
+* fix(pipeline): emit spec_uri from the same spec the CLI uploaded
+
+The `Compute spec_uri output` step in generate-dataset-shards.yaml was reading
+  `${RUN_METADATA_DIR}/input_spec.json`, which was produced by an upfront `materialize_spec` call.
+  That call generates a fresh run_id timestamp each invocation, and `synth-setter-generate-dataset`
+  then generates *another* fresh run_id when it materializes + uploads the canonical spec to R2. The
+  workflow output `spec_uri` therefore pointed at a run_id that did NOT exist in R2, and downstream
+  `validate-dataset-shards` cells failed with FileNotFoundError after rclone copyto silently no-op'd
+  on the missing key.
+
+Single-source-of-truth fix:
+
+- Drop the upfront `materialize_spec` from both rows. The CLI's own `write_spec_locally(spec,
+  _REPO_ROOT)` already writes the canonical `data/<task>/<run>/metadata/input_spec.json` before it
+  uploads to R2; the second materialization was redundant and decoupled the run_id. - Have each
+  generate step emit `spec_path` as a step output (host path to the canonical spec the CLI just
+  wrote). For runpod/oci the docker mount `${{ github.workspace }}:/home/build/synth-setter` makes
+  the in-container file the same host file, so the outer step resolves it identically. - `Validate
+  spec exists` and `Compute spec_uri output` read from `steps.gen_local.outputs.spec_path ||
+  steps.gen_docker.outputs.spec_path` (one is always empty because the matrix branches are
+  `if:`-gated). - `Upload run metadata` adds the canonical spec to the debug artifact via `path:` so
+  operators don't have to fetch R2 to inspect the run.
+
+The pre-existing matrix-cell-pairing limitation (tracked in #1154) is orthogonal and stays out of
+  scope.
+
+* test(pipeline): remove stale mock_rclone_subprocess fixture
+
+The canonical upload path goes through spec_io.upload_spec -> r2_io.subprocess.check_call, which
+  mock_upload_spec already hermeticizes; skypilot_launch itself never calls subprocess.check_call
+  directly. The fixture patched a non-existent call site and its docstring was misleading.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+
 ## v5.5.1 (2026-05-19)
 
 ### Bug Fixes
