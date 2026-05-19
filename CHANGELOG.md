@@ -1,6 +1,244 @@
 # CHANGELOG
 
 
+## v5.5.0 (2026-05-19)
+
+### Documentation
+
+- **pipeline**: Drop <output_dir> placeholder; runner anchor is <repo_root>
+  ([#1127](https://github.com/tinaudio/synth-setter/pull/1127),
+  [`054630c`](https://github.com/tinaudio/synth-setter/commit/054630c33dcfc4321190d236833c6c36ec8d4584))
+
+* docs(pipeline): drop <output_dir> placeholder; runner anchor is <repo_root>
+
+Last-round Copilot review on PR #1120 flagged that several docs use <output_dir> as a placeholder
+  for the operator-side artifact root, but cli/generate_dataset.py::main() now passes _REPO_ROOT
+  directly — cfg.paths.output_dir is only ever a defensive shim for ${hydra:runtime.output_dir}
+  resolution. Replacing the placeholder removes the conflation with Hydra's runtime output dir.
+
+- docs/design/storage-provenance-spec.md §3a 'Materialized spec' table runner row: local path
+  documented as <repo_root>/data/... with an inline note about _REPO_ROOT vs cfg.paths.output_dir.
+
+- docs/doc-map.yaml: data-pipeline + storage-provenance entries for spec_io.py use <repo_root> and
+  name _REPO_ROOT as the runner anchor.
+
+- src/synth_setter/pipeline/spec_io.py: local_spec_path's output_dir param docstring explains that
+  the runner anchors at _REPO_ROOT; write_spec_locally points readers at local_spec_path's
+  convention.
+
+No source-of-truth changes — pure docs + docstring touch-ups.
+
+Closes #1126 Refs #1120 Refs #603
+
+* docs(pipeline): apply doc-drift advisory — sweep module docstring + stale run() caller
+
+doc-drift advisory on PR #1127 caught two misses the original commit left behind:
+
+- src/synth_setter/pipeline/spec_io.py module docstring still used <output_dir>/data/... while the
+  PR claimed to drop the placeholder. The line describes the runner's behavior end-to-end, so
+  switching to <repo_root> matches the new anchoring in storage-provenance-spec.md and the doc-map
+  entries. The :returns: line at L49 stays as <output_dir> because it legitimately refers to the
+  parameter name.
+
+- docs/doc-map.yaml L70 listed the spec_io call sites as 'main() and run()', but run() no longer
+  calls any spec_io helper after PR #1120 moved the canonical upload to main(). Pre-existing drift,
+  but this PR touches the line and should fix it.
+
+Refs #1126 Refs #1120 Refs #603
+
+* docs(doc-map): drop stale run() from spec_io caller list
+
+run() no longer calls any spec_io helper after PR #1120 moved the canonical R2 upload to main().
+  doc-map L70 still listed it.
+
+* docs(spec_io): align local_spec_path :returns: placeholder with module header
+
+Copilot review on #1127 flagged that the `:returns:` line still used `<output_dir>` while the module
+  docstring switched to `<repo_root>`. Keep the parameter-named placeholder (it's the function's
+  actual parameter) but tie it back to the runner's anchor for consistency.
+
+Refs #1120 Refs #1126
+
+### Features
+
+- **pipeline**: Synth-setter-spec-uri emits canonical URI from spec alone + add find_input_specs
+  ([#1129](https://github.com/tinaudio/synth-setter/pull/1129),
+  [`264797e`](https://github.com/tinaudio/synth-setter/commit/264797e2163efbdcb9565aca170f7e1833e63acf))
+
+* feat(pipeline): synth-setter-spec-uri emits canonical URI from spec alone + add find_input_specs
+
+Evolves the `synth-setter-spec-uri` CLI to take only the spec path and emit
+  `spec.r2.input_spec_uri()` (the canonical under-prefix `<prefix>input_spec.json` URI), dropping
+  the `cluster_name` argument that keyed the launcher's transport copy. Adds
+  `find_input_specs(data_dir)` to discover already-materialized specs under
+  `<output_dir>/data/<task>/<run>/metadata/`.
+
+The two-step retirement of the launcher's transport key (PR-4 will drop `upload_spec_to_r2` and the
+  `LAUNCHER_SPEC_R2_PREFIX` constant) means this PR leaves the launcher code path on main unchanged.
+
+The `.github/workflows/generate-dataset-shards.yaml` "Compute spec_uri output" step now invokes the
+  CLI with one arg. SPEC_PATH still resolves to the local materialized spec until PR-4 retargets it;
+  the emitted URI is the canonical destination either way.
+
+Refs #1115
+
+* chore(pipeline): tighten spec_uri workflow comment
+
+Drop redundant reference to PR-4 (already implied by #1115) and trim the forward-looking sentence to
+  focus on the retirement of the launcher key.
+
+* chore(constants): clarify LAUNCHER_SPEC_R2_PREFIX still in use
+
+Reword the docstring above LAUNCHER_SPEC_R2_PREFIX: the prefix is still actively read by
+  ``skypilot_launch.upload_spec_to_r2`` as the #749 file_mounts workaround. What changed in #1115 is
+  that ``pipeline.ci.spec_uri`` no longer imports the prefix; the prefix itself will retire only
+  when #749 is upstream-fixed.
+
+Refs #1129
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* ci(pipeline): install python-dotenv in validate-spec workflow lite env
+
+PR #1120 added a top-level `from dotenv import dotenv_values` to `r2_io.py`. The `validate-spec` job
+  in `validate-dataset-shards.yaml` installs the project with `--no-deps + pydantic`, which crashes
+  the import chain at `validate_spec.py → r2_io.py` with `ModuleNotFoundError: No module named
+  'dotenv'`.
+
+Add `python-dotenv` to the existing `--no-deps + pydantic` step. The proper long-term fix is to
+  split `[project.dependencies]` into a lightweight `pipeline-ci` group so workflows can `pip
+  install -e .[pipeline-ci]` instead of hand-picking deps onto `--no-deps` — that's tracked at
+  #1139.
+
+Refs #1113
+
+* docs(pipeline): drop stale spec_uri rationale + scope-back find_input_specs in doc-map
+
+- docs/doc-map.yaml: drop "per-job" qualifier on the ci/** covers line (the per-job extraction shim
+  was removed in this PR), and scope back the spec_io.py covers line so it no longer claims
+  find_input_specs is called from cli/generate_dataset.py — the helper is added for future use and
+  is not yet wired. - src/synth_setter/pipeline/ci/spec_uri.py: rewrite the second docstring
+  paragraph to motivate the Python-not-bash choice on what the script actually does (parse via the
+  real DatasetSpec model, distinct exit codes for argv/fs/parse) instead of the now-deleted
+  LAUNCHER_SPEC_R2_PREFIX / R2_URI_SCHEME constants.
+
+* docs(reference): refresh github-actions spec_uri shape to canonical under-prefix URI
+
+The artifact-chains section still described the validate-dataset-shards input as
+  r2://<bucket>/skypilot-launcher-specs/<cluster_name>.json — that was the per-job extraction shape
+  this PR removed. Update the text to the canonical r2://<bucket>/<prefix>input_spec.json shape
+  emitted by synth-setter-spec-uri, and note that the launcher still writes the legacy transport
+  copy while #1115 retirement is in progress.
+
+* chore(ci): refresh stale spec_uri comments + workflow_dispatch example URI
+
+- validate-dataset-shards.yaml: update the workflow_dispatch spec_uri example to the canonical
+  r2://<bucket>/<prefix>input_spec.json shape; the per-job
+  r2://<bucket>/skypilot-launcher-specs/<cluster_name>.json shape it referenced no longer matches
+  what generate-dataset-shards emits as its spec_uri output. - test-dataset-generation.yml: clarify
+  both the header comment and the comment above the validate job that the per-cell URI passed to the
+  validate matrix is intentionally the launcher's transport copy (deterministic from cluster_name)
+  rather than the canonical spec_uri output, while #1115 retirement is in progress. PR-4 flips the
+  wiring to consume needs.generate-launcher.outputs.spec_uri.
+
+* docs(pipeline): scope-back find_input_specs docstring + correct validate-job URI in reference
+
+Address Copilot review on PR #1129: - src/synth_setter/pipeline/spec_io.py: reword find_input_specs
+  docstring from "Used by the @hydra.main entrypoint" to "Intended for ... ; not yet wired in
+  cli/generate_dataset.py" — the helper is added in this PR but has no caller in src/ yet, and PR-4
+  wires it. - docs/reference/github-actions.md: align the bullet with the actual
+  validate-dataset-shards wiring. The validate jobs currently read the launcher transport copy (the
+  URI is built deterministically from the per-cell cluster_name pattern in
+  test-dataset-generation.yml's validate job); only `generate-dataset-shards`'s `spec_uri` output is
+  the canonical under-prefix URI. A follow-up PR flips the validate job's input.
+
+* chore(ci): spell out both spec_uri shapes in validate-dataset-shards dispatch input
+
+Address Copilot review on PR #1129: the workflow_dispatch input description for `spec_uri` only
+  mentioned the canonical under-prefix form, but test-dataset-generation.yml's validate job still
+  passes the legacy launcher transport URI while #1115 retirement is in progress. Update the
+  description to call out both shapes are accepted.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Internal-Feat
+
+- **pipeline**: Dispatch_via_skypilot injects canonical WORKER_SPEC_URI; promote WORKER_SPEC_URI_ENV
+  constant ([#1135](https://github.com/tinaudio/synth-setter/pull/1135),
+  [`32e7288`](https://github.com/tinaudio/synth-setter/commit/32e7288966b0f3e22f9c1277b62e1b6171078e1f))
+
+* internal-feat(pipeline): dispatch_via_skypilot injects canonical WORKER_SPEC_URI
+
+Promotes ``_WORKER_SPEC_URI_ENV`` from ``skypilot_launch.py`` (module-private) to
+  ``pipeline/constants.py`` as public ``WORKER_SPEC_URI_ENV``, next to ``INPUT_SPEC_FILENAME``. CI
+  helpers and future PR-3/PR-4 wiring can now import it from one canonical home.
+
+``dispatch_via_skypilot`` gains a required ``spec_uri: str`` keyword-only kwarg. The worker's
+  ``WORKER_SPEC_URI`` env is now sourced from this kwarg (the canonical ``spec.r2.input_spec_uri()``
+  ``main()`` uploaded) rather than from ``upload_spec_to_r2``'s return value. The legacy
+  ``upload_spec_to_r2`` call still runs for older CI workflows; it is removed in PR-4.
+
+``generate_dataset.main()`` threads ``spec.r2.input_spec_uri()`` (not
+  ``spec.r2.uri(INPUT_SPEC_FILENAME)`` — that omits the run prefix) into the dispatch call so the
+  worker reads the same R2 object ``main()`` just uploaded.
+
+Refs #1114
+
+* docs(pipeline): correct WORKER_SPEC_URI comments to match actual consumers
+
+Three documentation accuracy fixes flagged by Copilot review on #1135:
+
+- ``constants.py``: drop the bogus ``load_spec_from_uri`` reference (no such function exists);
+  reword to name the real consumers today (launcher injection + CI helper reconstruction) and flag
+  that no worker code reads this env var yet — PR-3 / PR-4 will swap that in. -
+  ``skypilot_launch.py::dispatch_via_skypilot`` docstring: stop implying the worker currently
+  downloads via ``WORKER_SPEC_URI``; the dispatched ``synth-setter-generate-dataset-from-hydra`` cmd
+  rebuilds from Hydra overrides and doesn't yet consume the env var. -
+  ``test_skypilot_launch.py::_DISPATCH_SPEC_URI``: rename "mirrors what ``input_spec_uri()`` would
+  resolve to" → "sentinel"; the hard-coded ``data/run/`` prefix doesn't match ``_build_spec``'s
+  ``test-dispatch`` task_name or its derived run-id segment, so the old comment was misleading. The
+  shape comment (``r2://<bucket>/<prefix>input_spec.json``) is preserved because that's the
+  load-bearing constraint.
+
+No behavioral change. Tests still green (179 passed in test_entrypoints).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* docs(pipeline): replace PR-3 / PR-4 references with issue #1115 / #1116
+
+Review feedback from #1135: future readers won't have context for what "PR-3" and "PR-4" refer to.
+  Swap the inline references for the actual tracking issues (#1115 = synth-setter-spec-uri canonical
+  emission; #1116 = workflow consumer migration + upload_spec_to_r2 deletion) so the comments stay
+  resolvable from the GitHub UI alone.
+
+Three doc-only updates, no behavioral change:
+
+- constants.py WORKER_SPEC_URI_ENV: "PR-3 / PR-4 will swap" → "#1115 / #1116 will swap". -
+  skypilot_launch.py::dispatch_via_skypilot docstring: "a future worker (PR-3 / PR-4)" → "a future
+  worker (#1115 / #1116)". - skypilot_launch.py legacy-upload comment: "Removed in PR-4." → "Removed
+  in #1116."
+
+Tests still green (179 passed in test_entrypoints sweep).
+
+* ci(pipeline): install python-dotenv in validate-spec workflow lite env
+
+PR #1120 added a top-level `from dotenv import dotenv_values` to `r2_io.py`. The `validate-spec` job
+  in `validate-dataset-shards.yaml` installs the project with `--no-deps + pydantic`, which crashes
+  the import chain at `validate_spec.py → r2_io.py` with `ModuleNotFoundError: No module named
+  'dotenv'`.
+
+Add `python-dotenv` to the existing `--no-deps + pydantic` step. The proper long-term fix is to
+  split `[project.dependencies]` into a lightweight `pipeline-ci` group so workflows can `pip
+  install -e .[pipeline-ci]` instead of hand-picking deps onto `--no-deps` — that's tracked at
+  #1139.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+
 ## v5.4.1 (2026-05-19)
 
 ### Bug Fixes
