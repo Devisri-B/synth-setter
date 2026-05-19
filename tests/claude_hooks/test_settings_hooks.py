@@ -1,4 +1,4 @@
-"""Tests that ``.claude/settings.json`` hooks are scoped to the intended commands.
+"""Tests that Claude hook settings are scoped to the intended commands.
 
 Regression coverage for the bug where ``if:`` was placed on the matcher-entry
 object (sibling of ``matcher``/``hooks``/``description``). Claude Code silently
@@ -52,7 +52,7 @@ def _find_handler(description_substring: str) -> dict[str, Any]:
     :param description_substring: Substring identifying the matcher-entry's ``description`` field.
     :returns: The single handler dict from the matcher-entry's ``hooks`` list.
     :rtype: dict[str, Any]
-    :raises AssertionError: If zero or >1 matcher entries match, or the matched entry has !=1 handler.
+    :raises AssertionError: If zero or >1 matcher entries match, or the entry has !=1 handler.
     """
     matches = [
         entry
@@ -152,12 +152,21 @@ def test_handler_if_values_use_permission_rule_syntax() -> None:
 # ---------------------------------------------------------------------------
 
 
-_EXPECTED_HANDLER_SCOPES: list[tuple[str, str]] = [
+_EXPECTED_HANDLER_SCOPES: tuple[tuple[str, str], ...] = (
     ("Branch safety", "Bash(git commit *)"),
     ("Pre-PR review gate", "Bash(gh pr create *)"),
     ("Doc-drift advisory review", "Bash(gh pr create *)"),
     ("PR review resolver", "Bash(git push *)"),
-]
+)
+
+_EXPECTED_SHARED_HOOK_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("Credential protection", "bash agent/hooks/edit-write.sh credential-protect"),
+    ("Auto-format", "bash agent/hooks/edit-write.sh format"),
+    ("Auto-test", "bash agent/hooks/edit-write.sh test"),
+    ("Taxonomy verification", "bash agent/hooks/verify-gh-taxonomy.sh"),
+    ("Doc-drift advisory review", "bash agent/hooks/doc-drift.sh"),
+    ("PR review resolver", "bash agent/hooks/pr-review-resolver.sh"),
+)
 
 
 @pytest.mark.parametrize(("description_substring", "expected_if"), _EXPECTED_HANDLER_SCOPES)
@@ -177,6 +186,50 @@ def test_named_handlers_carry_expected_if_scope(
     )
 
 
+@pytest.mark.parametrize(
+    ("description_substring", "expected_command"), _EXPECTED_SHARED_HOOK_COMMANDS
+)
+def test_named_handlers_use_shared_agent_hook_paths(
+    description_substring: str, expected_command: str
+) -> None:
+    """Claude settings invoke shared agent hook implementations where available.
+
+    :param description_substring: Substring identifying the matcher-entry's description.
+    :param expected_command: The shared hook command the handler must execute.
+    """
+    handler = _find_handler(description_substring)
+    assert handler.get("command") == expected_command
+
+
+def test_credential_guard_uses_tool_input_file_path_not_embedded_text() -> None:
+    """Credential guard keys off ``.tool_input.file_path`` only.
+
+    This covers quoted ``file_path`` text inside edit payload content, which broke
+    the old grep/head/sed extraction.
+    """
+    command = _find_handler("Credential protection")["command"]
+    payload = {
+        "tool_input": {
+            "file_path": "src/example.py",
+            "old_string": '"file_path": ".env"',
+            "new_string": '"file_path": "secrets.pem"',
+        }
+    }
+
+    result = _run_hook_command(command, payload)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_credential_guard_blocks_secret_file_path() -> None:
+    """Credential guard still blocks the actual ``.tool_input.file_path`` target."""
+    command = _find_handler("Credential protection")["command"]
+    result = _run_hook_command(command, {"tool_input": {"file_path": ".env.local"}})
+
+    assert result.returncode == 1
+    assert "BLOCKED" in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # Behavioural tests for the pre-PR review gate body
 # ---------------------------------------------------------------------------
@@ -186,7 +239,7 @@ def test_named_handlers_carry_expected_if_scope(
 def pre_pr_gate_command() -> str:
     """Yield the shell ``command`` body of the gh-pr-create PreToolUse gate.
 
-    Currently a one-line wrapper that invokes ``.claude/hooks/pre-pr-review-gate.sh``;
+    Currently a one-line wrapper that invokes ``agent/hooks/pre-pr-review-gate.sh``;
     the helper runs it via ``bash -c`` so the wrapper re-enters the script transparently.
 
     :returns: The shell command string from the gate handler.
