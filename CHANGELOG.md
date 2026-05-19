@@ -1,6 +1,227 @@
 # CHANGELOG
 
 
+## v5.3.0 (2026-05-19)
+
+### Chores
+
+- **claude**: Gitignore qrspi thoughts/ working directory
+  ([#1102](https://github.com/tinaudio/synth-setter/pull/1102),
+  [`3c160a6`](https://github.com/tinaudio/synth-setter/commit/3c160a6fae04c25acbfcceacc3d17cb3663e0189))
+
+The thoughts/ directory is where the qrspi suite of skills and research_codebase / create_plan /
+  thoughts-locator / thoughts-analyzer tooling write local working notes (research, plans, design
+  docs). It is developer-local state, not source code.
+
+Add it under the existing # Claude Code section alongside .claude/ and .agent-reviews/.
+
+Closes #1101
+
+- **devcontainer**: Persist tmux sessions across rebuilds via tmux-continuum + TPM
+  ([#1104](https://github.com/tinaudio/synth-setter/pull/1104),
+  [`42b1e48`](https://github.com/tinaudio/synth-setter/commit/42b1e4829afa6b3d1a822b8249259b5ca47b93a1))
+
+* feat(devcontainer): persist tmux sessions across rebuilds via tmux-continuum + TPM
+
+Wire TPM (tmux plugin manager) plus tmux-resurrect and tmux-continuum into the devcontainer so a
+  `Rebuild Container` no longer wipes open tmux windows/panes/layouts. The resurrect state dir lives
+  on a named docker volume (synth-setter-tmux-resurrect) mounted at the standard XDG path, so
+  snapshots survive container recreation.
+
+post-create.sh clones TPM into $HOME/.tmux/plugins/tpm and runs install_plugins non-interactively,
+  so users don't need to hit prefix+I on first launch. The install is run once per $HOME (both the
+  root and the runuser→dev pass), matching the existing tmux.conf install flow.
+
+Refs #1103. Builds on #1048 (tmux as default terminal) and #1053 (per-user tmux.conf install via
+  post-create.sh).
+
+* fix(devcontainer): address local-review findings on tmux-continuum setup
+
+- tmux.conf: document why @continuum-save-interval is 5 (vs default 15). - post-create.sh: keep TPM
+  install_plugins stderr visible so the underlying git/clone error surfaces when install fails (was
+  2>&1'd away). - post-create.sh: note that the resurrect named volume is dev-user only
+  (DEVCONTAINER_USER=root sessions land on the unmounted root path). - doc-map.yaml +
+  docs/reference/docker.md: enumerate the new synth-setter-tmux-resurrect named volume and the
+  TPM/continuum plugin set under the relevant covers: entries.
+
+Refs #1103.
+
+* fix(devcontainer): isolate TPM install_plugins from user's tmux socket
+
+TPM's helpers (scripts/helpers/plugin_functions.sh:_tpm_path) shell out to `tmux start-server` at
+  module-load time without -L, which binds the default /tmp/tmux-$UID/default socket. When
+  post-create.sh is rerun manually inside an already-running devcontainer (e.g. while verifying
+  changes locally before opening this PR), that bind() replaces the on-disk socket dirent and
+  orphans the user's running tmux server — existing sessions stay alive in-kernel but no new `tmux`
+  invocation can reach them. VS Code then reports "terminal process /usr/bin/tmux 'new-session'
+  failed to launch (exit code: 1)".
+
+Wrap install_plugins with TMUX_TMPDIR=$(mktemp -d) so its internal `tmux start-server` lands on a
+  throwaway socket directory, then kill that ephemeral server and clean up. The user's default
+  socket is untouched.
+
+### Features
+
+- **pipeline**: Nest R2Location into DatasetSpec
+  ([#1099](https://github.com/tinaudio/synth-setter/pull/1099),
+  [`2fce8a2`](https://github.com/tinaudio/synth-setter/commit/2fce8a2ed239af0bfb512b4001c5a4bcc6be0eda))
+
+* feat(pipeline): nest R2Location into DatasetSpec with URI helpers
+
+Replaces the flat ``r2_bucket`` / ``r2_prefix_root`` / ``r2_prefix`` fields on ``DatasetSpec`` with
+  a single nested ``r2: R2Location`` model carrying typed URI-construction helpers (``uri``,
+  ``rclone_prefix``, ``shard_uri``). A model validator on ``DatasetSpec`` promotes legacy-form input
+  dicts and JSON-loaded specs already in R2 into the new shape so existing ``input_spec.json`` files
+  still parse and re-emit on the new shape.
+
+Folds in three related cleanups that touch the same call-site set:
+
+- Centralize ``R2_URI_SCHEME = "r2://"`` and ``RCLONE_REMOTE = "r2"`` in
+  ``synth_setter.pipeline.constants``; ``r2_io._to_rclone_path`` is promoted to public
+  ``to_rclone_path`` and used by ``skypilot_launch.upload_spec_to_r2`` instead of inline rclone-form
+  string concatenation. - ``configs/r2/default.yaml`` is the source of the nested ``r2`` block.
+  ``configs/dataset.yaml`` drops its flat-key interpolations; the ``10-1k-shards`` experiment
+  override uses the nested form (``r2.bucket: experiments``). - Workflow
+  ``generate-dataset-shards.yaml`` replaces its inline ``python3 -c "..."`` one-liner with a new
+  ``synth-setter-spec-uri`` console script that reads ``input_spec.json`` and emits the canonical
+  ``r2://bucket/skypilot-launcher-specs/<cluster>.json`` URI.
+
+Refs #121
+
+* ci(pipeline): update test-dataset-generation workflow to nested cfg.r2.bucket
+
+The setup step's inline ``python3 -c`` script still read ``cfg.r2_bucket`` — that flat key was
+  removed by the R2Location migration. Switch to ``cfg.r2.bucket`` so the workflow's R2 bucket
+  output resolves under the nested config shape.
+
+* docs(pipeline): nest r2_bucket/r2_prefix refs into r2.bucket/r2.prefix
+
+* refactor(pipeline): address PR #1099 Copilot review feedback
+
+- Clarify R2Location module docstring: ``prefix`` is required on the model; derivation happens at
+  the DatasetSpec ``mode='before'`` validator, not inside R2Location itself. - Tighten
+  ``_default_r2_location`` docstring to say "build a partial r2 dict" and explicitly state that
+  ``bucket`` is intentionally omitted so the nested R2Location validator surfaces the
+  missing-required-field error. - Move ``_LAUNCHER_SPEC_R2_PREFIX`` into ``pipeline/constants.py``
+  as ``LAUNCHER_SPEC_R2_PREFIX`` and import it from both ``skypilot_launch`` and ``ci/spec_uri`` so
+  the launcher and the CI URI helper cannot drift. - ``ci/spec_uri.main`` now catches ``OSError`` /
+  ``ValueError`` / ``ValidationError`` from ``compute_spec_uri`` and exits 3 with a one-line stderr
+  message instead of letting the traceback escape — the docstring already promised a clean non-zero
+  exit on invalid spec content. Adds two regression tests (malformed JSON, schema violation).
+
+* feat(pipeline): expose canonical R2 layout via R2Location URI helpers
+
+Adds per-object URI methods to R2Location for every well-known file in the dataset-run layout (per
+  docs/design/storage-provenance-spec.md §2): input_spec_uri, config_yaml_uri, dataset_card_uri,
+  dataset_complete_marker_uri, split_uri, stats_uri, worker_staged_shard_uri,
+  worker_attempt_report_uri.
+
+All helpers route through a new _under_prefix(name) private method so flat to nested layout
+  migrations (#385 for metadata/, #406 for shards/ and metadata/workers/) can happen in one place
+  without touching call sites.
+
+The class docstring embeds the canonical layout tree from the storage-provenance spec, with
+  #385/#406 annotations on the two subdirectories documented as future state.
+
+* docs(pipeline): point R2Location at storage-provenance-spec instead of duplicating the tree
+
+The module docstring embedded a 13-line ASCII tree of the R2 object layout, plus two paragraphs
+  explaining DatasetSpec's flat-form back-compat promotion. Both already live in authoritative
+  sources — the tree in docs/design/storage-provenance-spec.md §2 + §3a (which calls itself the
+  authoritative source for R2 paths), and the prefix-derivation / flat-form promotion in
+  DatasetSpec's r2-field description and its _normalize_r2_input / _default_r2_location /
+  _fill_default_r2_prefix docstrings in spec.py.
+
+Replace both with one-line pointers to those canonical sources. Net -18 lines and the layout tree
+  now has exactly one source of truth.
+
+Refs #1099
+
+* fix(pipeline): reject whitespace-wrapped slash-only r2.prefix_root
+
+The prior validator did .strip("/") then .strip(), so values like " / " passed: ".strip('/')" left
+  the spaces, then ".strip()" collapsed to "/" which is truthy. Swap the order so whitespace is
+  removed first, then slashes — " / " → "/" → "" → rejected.
+
+Adds a regression test covering " / ", "\t//\n", and " /// ".
+
+Refs #1099 review (Copilot)
+
+* fix(pipeline): strip whitespace from r2.prefix_root and run spec-uri in docker
+
+Two follow-ups from Copilot's review of 2db4f07:
+
+- R2Location.prefix_root validator now returns value.strip() so a caller passing ' data ' doesn't
+  survive into make_r2_prefix (which only strips slashes) as ' data /<task>/<run>/'. Reject path
+  (blank or slash-only after whitespace + slash strip) is unchanged. -
+  generate-dataset-shards.yaml's 'Compute spec_uri output' step now runs synth-setter-spec-uri
+  inside the already-pulled docker image. The console script is installed in the image for every
+  provider; on the runner it was only available on the skypilot-local row, so runpod/oci jobs would
+  have failed with command-not-found.
+
+* ci(pipeline): run spec-uri on the runner, not in the pulled image
+
+The previous attempt invoked synth-setter-spec-uri via docker run against the pulled dev-snapshot
+  image to address a Copilot review comment about runpod/oci not pre-installing the project package
+  on the runner. That introduced a race: test-dataset-generation.yml's "Pull image" step runs in
+  parallel with the per-PR docker-image-build.yml, so the pulled dev-snapshot tag is whatever was
+  previously pushed (typically main) and the brand-new synth-setter-spec-uri console script is not
+  in it. The failing CI step exits 127 with "executable file not found in $PATH".
+
+Switch to running on the runner. The skypilot-local row has the package already installed via
+  "Install launcher deps"; runpod/oci runs fall through to a minimal `python3 -m pip install -e .`
+  guarded by command -v. No docker dependency, no race.
+
+* fix(pipeline): reject slash-wrapped whitespace in r2.prefix_root
+
+The previous validator stripped surrounding whitespace then checked that the slash-stripped result
+  was non-empty. A value like "/ /" (slashes wrapping a lone space, no surrounding whitespace)
+  passed: stripped = "/ /" strip("/") = " " not " " = False and survived into make_r2_prefix as " "
+  — yielding a malformed prefix like " /<task>/<run>/" with an embedded space.
+
+Add a final strip() on the slash-stripped value so any combination of slashes-and-whitespace
+  collapses to "" and is rejected. Existing non-empty values ("data", " data ", "sub/data") still
+  pass.
+
+* ci(pipeline): lighten spec-uri runner fallback; clarify LAUNCHER_SPEC_R2_PREFIX
+
+The generate-dataset-shards.yaml `Compute spec_uri output` step previously fell back to `pip install
+  -e .` on the runner to get the `synth-setter-spec-uri` console script for the runpod/oci rows.
+  That drags in the entire project dependency tree (torch, pedalboard, skypilot, ...) on a path that
+  only needs pydantic and stdlib. Switch the fallback to `pip install pydantic>=2` + `PYTHONPATH=src
+  python3 -m synth_setter.pipeline.ci.spec_uri ...`, matching the module's actual import footprint.
+
+Also tighten the docstring above `LAUNCHER_SPEC_R2_PREFIX` in `pipeline/constants.py`: the launcher
+  uploads a per-job transport copy named `<job_name>.json` under this prefix, not `input_spec.json`.
+  The previous wording implied the object key was `input_spec.json` at this location, which is the
+  local materialized filename rather than the uploaded key.
+
+Addresses Copilot review comments on PR #1099.
+
+* Revert "ci(pipeline): switch spec-uri runner fallback to PYTHONPATH+module"
+
+Reverts only the workflow portion of eb29780. The reviewer (Copilot comment 3263224461) suggested
+  replacing the `pip install -e .` fallback with `PYTHONPATH=src python3 -m
+  synth_setter.pipeline.ci.spec_uri`, but the maintainer's stated preference is to keep ad-hoc
+  inline invocations out of the workflow and route through the official `synth-setter-spec-uri`
+  console-script entrypoint (reply on 3263224461). Restore the `pip install -e .` fallback so the
+  workflow keeps using the registered console script unconditionally.
+
+The `LAUNCHER_SPEC_R2_PREFIX` comment fix from eb29780 stays — it was a pure docstring
+  clarification, independent of the workflow change.
+
+* docs(pipeline): update spec.py docstrings to nested r2.prefix paths
+
+DatasetSpec docstring, the task_name field description, and the _task_name_must_not_be_blank
+  validator docstring still referenced the old flat r2_prefix field after the R2Location migration.
+  Repoint them at the nested r2.prefix path so the prose matches the schema. Same pass on the module
+  docstring.
+
+The legacy flat key names that remain (_LEGACY_FLAT_R2_KEYS mapping, back-compat shim docstrings,
+  _fill_default_r2_prefix helper name) are deliberate: they describe legacy-key promotion paths and
+  historical factory names, not the live field surface.
+
+
 ## v5.2.0 (2026-05-19)
 
 ### Chores
