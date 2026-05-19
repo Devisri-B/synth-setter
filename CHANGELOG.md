@@ -1,6 +1,702 @@
 # CHANGELOG
 
 
+## v5.2.0 (2026-05-19)
+
+### Chores
+
+- **pipeline**: Document R2 path sources, mark finalize as future-state
+  ([#1094](https://github.com/tinaudio/synth-setter/pull/1094),
+  [`9ad779a`](https://github.com/tinaudio/synth-setter/commit/9ad779aeff61d92c1b7552182ea81d9e66242519))
+
+* docs(architecture): fix stale R2-bucket-in-constants claim
+
+pipeline/constants.py holds only INPUT_SPEC_FILENAME — the R2 bucket name lives in
+  configs/r2/default.yaml (interpolated into DatasetSpec via Hydra), not in constants.py. Update the
+  directory-structure callout to match what the file actually contains.
+
+Refs #121
+
+* docs(design): mark metadata/workers/ + finalize as future-state
+
+The design docs (data-pipeline.md, data-pipeline-implementation-plan.md, storage-provenance-spec.md)
+  describe a staging layout under `metadata/workers/` plus a `finalize` stage that promotes shards
+  into `data/shards/`. The current MVP worker (`src/synth_setter/cli/generate_dataset.py`) writes
+  shards directly to `data/<task_name>/<run_id>/` and there is no finalize stage in code yet.
+
+Add explicit "Future state — see #406" banners and inline annotations on every section that
+  describes the staging-and-promote model so readers don't mistake the planned architecture for
+  current behavior. Annotate the storage-provenance-spec.md §3a tree and bullets identifying which
+  paths are current vs. future state.
+
+Tracking: #406 (CLAUDE.md / design-doc reconciliation), #72 (Phase 5 Pipeline CLI).
+
+Refs #406 Refs #72 Refs #121
+
+* docs(design): clarify dual materialized-spec locations
+
+The DatasetSpec JSON is uploaded to R2 from two call sites with two distinct purposes:
+
+1. Worker (`src/synth_setter/cli/generate_dataset.py:181-191`) writes to
+  `{spec.r2_prefix}input_spec.json` — the canonical provenance copy archived next to the shards it
+  parameterized. 2. Launcher (`src/synth_setter/pipeline/skypilot_launch.py:342-344`) writes to
+  `skypilot-launcher-specs/{job_name}.json` and injects that URI as `WORKER_SPEC_URI` — pure
+  transport, workaround for #749 (SkyPilot's RunPod backend rejects programmatic
+  `task.update_file_mounts`).
+
+Both copies are intentional and serve different roles. CI workflows (`validate-spec`,
+  `validate-shard`) currently read the launcher copy via the `spec_uri` output of
+  `generate-dataset-shards.yaml`; the worker copy is the long-lived archive that the future
+  `finalize` / `status` commands will read.
+
+Document the split in `storage-provenance-spec.md` §3a (new subsection "Materialized spec: two
+  destinations") and add a pointer bullet in `configuration-reference.md` §2.1 so future readers
+  don't try to consolidate them.
+
+Refs #121 Refs #385
+
+* docs(design): drop stale R2 bucket constant claims from layout + doc-map
+
+* docs(design): align future-state shard path with per-run prefix
+
+Address Copilot review feedback on #1094:
+
+- storage-provenance-spec.md §3a tree: clarify the 'shards/' annotation to say no shards/ subdir
+  exists yet (current workers upload shard files directly under the run prefix root), instead of the
+  ambiguous 'directly here' phrasing. - data-pipeline.md §5 and §6 future-state banners: replace the
+  ambiguous 'data/shards/' path with the authoritative per-run prefix
+  'data/{dataset_config_id}/{dataset_wandb_run_id}/shards/' from storage-provenance-spec.md §3a,
+  with a back-link for traceability.
+
+Refs #121 Refs #385 Refs #406
+
+* docs(design): drop ambiguous slash from {r2_prefix} input_spec paths
+
+`make_r2_prefix` returns a string already ending in `/`, so `{r2_prefix}/input_spec.json` reads like
+  it would produce a double-slashed key. Standardize the docs to `{r2_prefix}input_spec.json` (the
+  form already used in the storage-provenance-spec §3a consumer table) and add a one-line pointer to
+  `make_r2_prefix` so the trailing-slash convention is discoverable.
+
+* docs(design): add skypilot-launcher-specs/ to R2 bucket layout §2
+
+Address Copilot's low-confidence suggestion on #1094: §2 "R2 Bucket Layout" previously enumerated
+  only the canonical `data/`, `train/`, `eval/` prefixes, but §3a introduces
+  `skypilot-launcher-specs/` as a transport-only top-level prefix. List it under §2 (with a footnote
+  that it is transport-only and not part of the dataset footprint) so the authoritative layout doc
+  is internally consistent.
+
+### Documentation
+
+- Add TrainConfig + ModelConfig pydantic schemas to mkdocs
+  ([#1065](https://github.com/tinaudio/synth-setter/pull/1065),
+  [`9a02b65`](https://github.com/tinaudio/synth-setter/commit/9a02b65f9771405a26b0a3b2301f9d78d8c72676))
+
+* internal-feat(docs): add TrainConfig + ModelConfig pydantic schemas to mkdocs
+
+Add ``synth_setter.schemas`` — a sibling to the existing ``synth_setter.pipeline.schemas`` package —
+  carrying pydantic models that document the training-time Hydra configs:
+
+- ``TrainConfig`` validates the top-level ``configs/train.yaml`` composition. - ``ModelConfig`` +
+  ``OptimizerConfig`` + ``SchedulerConfig`` validate every YAML under ``configs/model/``.
+
+The models use ``strict=True, extra="allow"`` so they refuse silent type coercion on the typed
+  scalar surface while letting Hydra-composed subtrees (``data``, ``trainer``, ``callbacks``, ...)
+  pass through. ``mkdocstrings`` + ``griffe-pydantic`` render the per-field ``description=`` strings
+  into two new auto-generated pages under ``docs/config_reference/``.
+
+Verification:
+
+- ``tests/schemas/`` asserts every shipped composition of ``train.yaml`` and every YAML under
+  ``configs/model/`` validates against the schemas, plus rejects bad inputs (blank ``task_name``,
+  non-bool ``train``, negative ``seed``, negative ``lr``, negative ``weight_decay``, blank
+  ``scheduler._target_``, missing ``lr``). - ``tests/test_docs_build.py`` runs ``mkdocs build
+  --strict`` end-to-end and asserts each pydantic field name renders in its page HTML — drift
+  between the schemas and the published pages fails at PR time. - ``.github/workflows/docs.yml``
+  gains a ``build-docs`` job that runs on pull_request events. It installs ``[docs,dev]``, builds
+  the site with ``--strict``, and runs both ``tests/test_docs_build.py`` and ``tests/schemas/`` so
+  the field-rendering assertions actually execute in CI.
+
+Refs #936
+
+* fix(ci): use --noconftest in build-docs to skip lightning-importing conftest
+
+The ``build-docs`` job installs only ``[docs,dev]`` to keep the install lightweight; the top-level
+  ``tests/conftest.py`` eagerly imports ``lightning`` via ``synth_setter.utils``, which crashes
+  pytest collection on this slim env. The docs-build tests don't depend on any conftest fixtures —
+  each test sets up its own Hydra context — so ``--noconftest`` is the minimal fix.
+
+* fix(docs): address Copilot review comments on TrainConfig docs PR
+
+Four findings from the Copilot review:
+
+1. ``TrainConfig`` class docstring overstated what ``TrainConfig()`` with no kwargs produces — only
+  the typed scalar surface, not the full Hydra-composed tree. Reworded to make the scalar-only scope
+  explicit. 2. ``build-docs`` CI job ran ``mkdocs build --strict`` twice — once standalone and once
+  inside the pytest session fixture. Dropped the standalone step; the pytest run already invokes
+  ``mkdocs build --strict`` itself and asserts on the rendered HTML. 3. ``tests/test_docs_build.py``
+  used a bare substring search for field names, which would false-positive on short names like
+  ``lr``, ``test``, ``train`` if they appeared anywhere in HTML/CSS/JS context. Switched to matching
+  the structural ``id="module.Class.field"`` anchor mkdocstrings emits for each field heading. 4.
+  ``_EXPECTED_FIELDS_BY_PAGE`` was hard-coded, so a field rename on the schema would silently keep
+  the test green. Now derived from ``model.model_fields`` at runtime — adding/removing/renaming a
+  typed field is automatically reflected in the expected anchor set.
+
+* fix(ci): scope pytest conftest exclusion narrowly per Copilot review
+
+The previous ``--noconftest`` flag was too broad — it disabled all ``conftest.py`` discovery in the
+  build-docs CI run, including ``tests/schemas/conftest.py`` which provides the
+  ``clean_global_hydra`` autouse fixture. Tests passed by accident (each ``with initialize(...)``
+  block already cleans up on its own), but the safety net for partial / xdist races was gone.
+
+Split into two pytest invocations:
+
+1. ``tests/schemas/`` runs with ``--confcutdir=tests/schemas`` so pytest stops conftest discovery at
+  the package boundary — ``tests/schemas/ conftest.py`` still loads, ``tests/conftest.py`` (which
+  imports lightning) doesn't. 2. ``tests/test_docs_build.py`` keeps ``--noconftest`` since it's
+  self-contained and has no package-local conftest to preserve.
+
+* internal-feat(docs): cover remaining train.yaml composition groups in mkdocs
+
+Extends the config-reference site to the other defaults: from configs/train.yaml beyond TrainConfig
+  + ModelConfig. Adds pydantic schemas (and rendered mkdocs pages) for DataConfig, TrainerConfig,
+  PathsConfig, ExtrasConfig, plus CallbacksConfig + LoggerConfig as RootModel wrappers around
+  dict[str, CallbackInstance | LoggerInstance].
+
+Same trust-boundary convention as the existing schemas: strict=True with extra="allow" on every
+  model, so Hydra-composed subtrees pass through but a StrictBool / NonBlankStr / PositiveInt
+  mismatch fails at compose time instead of corrupting a downstream call. The hydra/ composition
+  group is intentionally skipped — configs/hydra/default.yaml only sets partial overrides on Hydra's
+  own internal config and Hydra owns that schema.
+
+Behavioural tests under tests/schemas/ parametrize each shipped YAML in the group and assert it
+  validates; negative cases pin the typed-scalar constraints. tests/test_docs_build.py is extended
+  so the docs-render assertions actually exercise every new typed field across all six new pages.
+
+* fix(docs): address Copilot review on extended config-reference PR
+
+Three findings from the post-push review of ed00233:
+
+* tests/schemas/test_callbacks_config.py — every YAML under configs/callbacks/ is a valid
+  ``callbacks=<name>`` selection (Hydra treats group leaves as selectable too), not only the
+  multi-callback compositions ``default``/``default_surge``/``eval_surge``. Switched the helper to
+  iterate all stems except ``none`` (which composes to ``None`` and short-circuits in
+  ``instantiate_callbacks``); coverage grows from 3 to 14 callback YAMLs.
+
+* .github/workflows/docs.yml — moved ``pages: write`` / ``id-token: write`` off the workflow-level
+  ``permissions:`` and onto ``deploy-docs`` only. ``build-docs`` (the PR-only job) now runs with
+  ``contents: read``, so Pages-write isn't granted on the PR path — including PRs from forks.
+
+* tests/test_docs_build.py — ``test_docs_page_renders_pydantic_field_anchor`` now asserts the page
+  file exists before reading it, so a missing page surfaces as a pytest assertion (pointing at
+  ``test_docs_page_emitted``) rather than the raw ``FileNotFoundError`` from ``read_text``.
+
+* internal-fix(schemas): address 41/45 review-round findings on PR #1065
+
+Schemas package - Introduce ``StrictAllowExtraModel`` base in ``_types.py``; every config schema
+  inherits it instead of repeating the trust-boundary ``ConfigDict`` - Tighten ``NonBlankStr`` on
+  three fields where blanks would silently break downstream: ``trainer.default_root_dir``,
+  ``train.ckpt_path``, ``train.optimized_metric`` - Drop YAML-value claims baked into field
+  descriptions (``trainer.log_every_n_steps``, ``val_check_interval``, ``gradient_clip_val``,
+  ``model.compile``); behavior-only wording - Replace ``lambda`` default for ``train.tags`` with
+  named ``_default_tags`` - Extract ``_FLOAT32_MATMUL_PRECISIONS`` constant in ``extras_config`` -
+  ``__init__.py``: drop list-enumeration docstring drift, add cross-package pointer to
+  ``synth_setter.pipeline.schemas``, mark ``_types`` private - Docstring on ``TrainConfig`` now
+  explicit that it's documentation-first (not enforced at runtime by ``cli/train.py`` today)
+
+Tests - ``tests/schemas/conftest.py``: add ``compose_train_cfg`` / ``compose_subtree`` /
+  ``_to_dict`` helpers; strengthen ``clean_global_hydra`` with post-yield leak assertion; document
+  ``--confcutdir`` requirement - Every ``test_*_config.py`` switches to the shared compose helpers,
+  removing duplicated ``initialize`` / ``compose`` / ``to_container`` / ``cast`` boilerplate - Add
+  ``assert isinstance(parsed, ...)`` after positive ``model_validate`` calls so the contract is
+  explicit, not "did not raise" - Replace exact-value assertions (``log_every_n_steps == 100``,
+  etc.) with type / range / property checks - Add blank-string negative tests for the three
+  newly-``NonBlankStr`` fields - Drop hard-coded callback-names spot-check; the parametrized
+  validation across every shipped YAML already covers it - Replace ``_NON_DICT_CALLBACK_CONFIGS``
+  closed-set filter with dict-at-discovery check + ``pytest.skip(rationale)`` - Extract
+  ``_VALID_TARGET`` constant in ``test_model_config`` - Add positive interpolation-resolution test
+  for ``${oc.env:...}`` on ``PathsConfig``
+
+tests/test_docs_build.py - Mark module ``pytest.mark.slow`` (it shells out to ``mkdocs build
+  --strict``) - Add ``page_html_cache`` session fixture to amortize per-(page, model, field) HTML
+  reads - Add spot-check that ``Field(description=...)`` text actually renders in the built page
+  (catches mkdocstrings dropping descriptions) - Defensive non-empty asserts on ``_PAGE_TO_MODELS``
+  and ``_expected_field_anchors()`` - Switch ``subprocess.run`` to ``check=True`` + ``try/except
+  CalledProcessError`` - Collapse 11-line essay above ``_PAGE_TO_MODELS`` to 3 lines
+
+.github/workflows/docs.yml - Collapse 16-line pytest rationale to one-line pointer (rationale moves
+  to ``tests/schemas/conftest.py`` docstring) - Add ``cache-dependency-path: pyproject.toml`` to
+  ``deploy-docs`` (matches ``build-docs``) - Guard ``workflow_dispatch`` deploys to ``main`` so
+  feature-branch dispatch can't publish
+
+Skipped with explicit approval (responses posted inline): - code-health #5 (pydantic re-export
+  module) — soft suggestion; would add indirection - tdd-impl #6 (collect-errors test pattern) —
+  current parametrization gives more precise pytest signal - ml-pipeline #2 (schemas/ package
+  rename) — cross-cutting; follow-up - ml-pipeline #5 (RootModel | None contract change) — schemas
+  aren't runtime-validated today, no observable benefit
+
+Refs #967
+
+* chore(docs): tighten comment hygiene on config-reference + schemas
+
+Apply /comment-hygiene rewrites across the new docs/config_reference/*.md,
+  src/synth_setter/schemas/*, the schemas test suite, and the docs workflow:
+
+- Cut the multi-paragraph page intros in docs/config_reference/*.md down to one short framing
+  paragraph before the ::: mkdocstrings directive; per-field detail already comes from
+  Field(description=...) via griffe. - Drop "Per-field descriptions live on the Field definitions
+  below" and similar boilerplate from class docstrings (rendered output already shows the fields, so
+  the line is filler). - Tighten module docstrings on each schema to the contract one line + one
+  short clarifying line. - Trim multi-sentence test docstrings to one line where the assertion
+  carries the rest, and drop the inline essays inside test_data_config's PROJECT_ROOT round-trip
+  case. - Collapse the 4-6 line comment blocks above docs.yml steps to one-line pointers; CLAUDE.md
+  no-comments-in-run-blocks rule was already clean.
+
+No behavioural changes: 96 schema tests + 48 docs-build tests still pass.
+
+* internal-fix(schemas): address 3 remaining Copilot review threads on PR #1065
+
+Three of Copilot's six remaining unresolved threads still applied to post-rebase code; the other
+  three were outdated against earlier commits (_all_callback_config_names already globs every leaf
+  yaml; workflow permissions already job-scoped — both fixed in 231fc3b).
+
+- tests/schemas/conftest.py: reword clean_global_hydra docstring to match assert-only teardown (the
+  previous "before and after" wording implied a missing clear-on-teardown). -
+  tests/schemas/test_callbacks_config.py: drop the stale "validates as an empty RootModel" inline
+  comment — none.yaml composes to None and is filtered by the pytest.skip above, never reaching
+  model_validate. - tests/test_docs_build.py: route page_html_cache through a helper that
+  pre-asserts the page exists with an actionable message, so a missing page surfaces as a readable
+  assertion instead of a bare FileNotFoundError from read_text.
+
+* internal-fix(schemas): address 3 new Copilot findings on 23e06ac
+
+Copilot's post-push review on 23e06ac flagged three new substantive concerns; all three apply and
+  are fixed here.
+
+- src/synth_setter/schemas/callbacks_config.py: clarify module docstring so it no longer conflates
+  schema validation (requires _target_) with the runtime helper's leniency (skips entries that lack
+  _target_). - src/synth_setter/schemas/{callbacks_config,logger_config}.py: pin
+  ConfigDict(strict=True) on the CallbacksConfig and LoggerConfig RootModel wrappers. They weren't
+  inheriting StrictAllowExtraModel's strict=True, which left a coercion gap (non-string keys,
+  dict-vs-str inputs) at the root level even though the inner instance classes are strict. -
+  tests/test_docs_build.py: add config_reference/dataset_spec to _PAGE_TO_MODELS so the existing
+  dataset-spec page is also covered by the schema↔docs drift assertion. +14 anchor checks (158
+  total).
+
+- **schemas**: Expand nested mkdocs config coverage
+  ([#1086](https://github.com/tinaudio/synth-setter/pull/1086),
+  [`0ed970b`](https://github.com/tinaudio/synth-setter/commit/0ed970b3e91225aec0108cf0c243770123ebdeac))
+
+* docs(schemas): describe every Pydantic Field; expand nested mkdocs models
+
+Fills the two gaps in the config-reference site that #936 explicitly deferred as separate quality
+  passes:
+
+1. Every plain field on DatasetSpec, RenderConfig, ShardSpec, ImageConfig, and ShardMetadata now
+  carries a `Field(description="...")` one-liner. griffe-pydantic surfaces these as per-field
+  docstrings on the rendered mkdocs site so each field reads as `name: type — one-line description`
+  instead of just `name: type`. 2. Nested model references (`render: RenderConfig`, `shards:
+  tuple[ShardSpec, ...]`) now expand on the dataset-spec page — added ``::: ...RenderConfig`` and
+  ``::: ...ShardSpec`` sections so their fields render below DatasetSpec with working anchor links.
+
+Also enables the `griffe_pydantic` extension under the mkdocstrings handler in `mkdocs.yml` (without
+  it, `description=` on a Pydantic Field is invisible to mkdocstrings' default griffe analyzer).
+  Adds new pages for ImageConfig and ShardMetadata and wires both into the Config Reference nav.
+
+No runtime behavior change — `description=` is read-only Pydantic metadata that surfaces in JSON
+  schema / validation errors / docs. All 114 schema tests continue to pass. The mandatory
+  tdd/code-health/simplify trio for non-docs code edits is a no-op here: the .py edits are
+  metadata-only and have no behavior to test.
+
+Refs #936
+
+* docs(schemas): trim filler in field descriptions; guard with regression test
+
+Iteration on the prior commit following `/repo-review-full-no-comments` findings (deduped across
+  code-health, comment-hygiene, tdd-implementation, and synth-setter-project-standards):
+
+- Drop "; mirrors RenderConfig.X" filler suffix from every ShardMetadata field — the class docstring
+  already states the relationship, the per- field repetition just creates a drift surface. - Drop ";
+  must be positive" / "; must be >= 1" tails that duplicated the RenderConfig validator behavior on
+  sample_rate, channels, signal_duration_seconds, and samples_per_shard. - Drop the literal
+  "(default ``data``)" parenthetical from r2_prefix_root — griffe-pydantic renders the symbolic
+  default (DEFAULT_R2_PREFIX_ROOT) on the docs site already. - Trim inline comments above
+  DatasetSpec.train_val_test_seeds and the auto-filled runtime block — they now duplicated the new
+  descriptions. - Drop the `# Sub-model` decorative banner and trim ImageConfig.{class docstring,
+  github_sha, issue_number, image_config_id} filler ("uniquely names this image config", "is
+  associated with"). - Add tests/pipeline/test_schemas/test_field_descriptions.py — a parametrized
+  regression-guard asserting every public field on every config model has a non-empty
+  `Field(description=...)`. Pins the contract that the mkdocs config-reference site stays populated
+  without pinning the wording (so refactors that drop a description fail here instead of silently
+  regressing the rendered page).
+
+Net effect: ~30 fewer lines in the schemas, 42 new parametrized tests (156 total schema tests, all
+  passing).
+
+* docs(schemas): fix task_name r2_prefix wording; register pages in doc-map
+
+Addresses the two doc-drift findings flagged on PR #1086:
+
+- The `task_name` description claimed it "becomes the leading path component of `r2_prefix` and
+  `run_id`". That's only true for `run_id` (`{task_name}-{ts}`); in `r2_prefix` the leading
+  component is `prefix_root` (default `data`) per `make_r2_prefix`'s output format
+  `<root>/<task_name>/<run_id>/`. Reword to: "becomes the prefix of `run_id` and the config-id path
+  segment of `r2_prefix`". - The three new `docs/config_reference/*.md` pages weren't registered in
+  `docs/doc-map.yaml`. Add a "Config reference (autogenerated)" block so future doc-drift checks
+  track them against their schema sources.
+
+* docs(schemas): drop duplicate manual headings above ::: directives
+
+mkdocstrings has show_root_heading: true in mkdocs.yml, so the ::: directive already emits an h2
+  root heading for each documented model. The manual `## ModelName` Markdown headings above each
+  directive created a second h2 with a competing anchor (e.g. `#imageconfig` vs
+  `#synth_setter.pipeline.schemas.image_config.ImageConfig`).
+
+### Features
+
+- **vst**: Plugin/gui lifecycle cadence flags on RenderConfig
+  ([#1084](https://github.com/tinaudio/synth-setter/pull/1084),
+  [`6d72949`](https://github.com/tinaudio/synth-setter/commit/6d72949e975a4a4eaad1361927ad83d8049a1530))
+
+* internal-feat(pipeline): add reload/open_gui per-render lifecycle flags to RenderConfig
+
+* internal-fix(pipeline): platform-aware open_gui default + patchable platform helper
+
+Addresses Copilot review feedback on PR #1084:
+
+- ``RenderConfig.open_gui_every_render`` now defaults via a platform-aware factory: ``False`` on
+  Darwin, ``True`` elsewhere. Bare Hydra render configs (e.g. ``configs/render/surge_xt.yaml``) that
+  omit the field construct cleanly on macOS instead of tripping
+  ``_open_gui_every_render_forbidden_on_darwin``. Explicit ``open_gui_every_render=True`` on Darwin
+  is still rejected. - Replace direct ``sys.platform`` reads in ``spec.py`` with a patchable
+  ``_current_platform()`` helper so tests can override the platform inside ``spec`` without mutating
+  the real ``sys.platform`` (the previous ``monkeypatch.setattr("...sys.platform", "linux")`` leaked
+  into every other consumer of ``sys.platform`` in the same interpreter — including the
+  ``surge_xt_smoke_datasets`` fixture's headless-wrapper decision). - Drop the autouse
+  ``_force_non_darwin_render_config_platform`` fixture in ``tests/conftest.py``; the new
+  platform-aware default makes the whole-suite override unnecessary, and Darwin-gate tests patch
+  ``_current_platform`` directly instead. - Add a regression test that bare ``RenderConfig()``
+  constructs on Darwin with ``open_gui_every_render=False``.
+
+* chore(metrics): tighten docstrings/comments per iteration-2 review
+
+Iteration-2 /repo-review-full-no-comments WARN cleanup: - Collapse _current_platform and
+  _default_open_gui_every_render docstrings to one-liners pointing at #714. - Collapse the
+  RenderConfig lifecycle-knobs inline comment to a pointer. - Tighten
+  test_open_gui_default_is_false_on_darwin docstring. - Rename
+  test_reload_plugin_every_render_is_platform_independent_on_darwin to
+  test_reload_plugin_every_render_both_values_accepted_on_darwin so the name reflects what the test
+  actually covers (Darwin only, not full platform-independence). - Update RenderConfig sketch in
+  data-pipeline.md to note the platform-aware default. - Reframe the surge_xt_smoke_datasets Darwin
+  CLI-arg comment in terms of the subprocess's validator, not local RenderConfig construction.
+
+* chore(pipeline): drop now-redundant Darwin CLI override; sync design-doc snippet
+
+Two Copilot review comments on PR #1084:
+
+- tests/conftest.py: the `if sys.platform == "darwin": ... append("--open_gui_every_render=False")`
+  block in `surge_xt_smoke_datasets` was added to satisfy the subprocess's `RenderConfig` validator
+  on Darwin hosts. Now that `open_gui_every_render` defaults to `False` on Darwin via
+  `Field(default_factory=_default_open_gui_every_render)`, the subprocess constructs cleanly without
+  the override — drop the dead branch. - docs/design/data-pipeline.md: the `RenderConfig` snippet
+  showed `open_gui_every_render: bool = True` with a trailing comment, which misrepresents the
+  platform-aware default. Update the snippet to
+  `Field(default_factory=_default_open_gui_every_render)` with a comment block describing the actual
+  `False on Darwin / True elsewhere` semantics and the rejection of explicit `True` on Darwin.
+
+Refs #705
+
+* feat(metrics): wire reload/open_gui per-render flags into the renderer
+
+PR #1084 added two boolean fields to RenderConfig (reload_plugin_every_render,
+  open_gui_every_render) but the renderer did not yet read them — load_plugin was unconditional and
+  the show_editor warm-up was forced on every non-Darwin load. This commit makes the flags
+  user-facing:
+
+- load_plugin gains open_gui: bool = True; skipping the warm-up is now selectable per call (Darwin
+  already skips unconditionally). - render_params gains optional plugin and open_gui kwargs. When
+  plugin is supplied, load_plugin and load_preset are skipped (the caller owns lifecycle); the
+  existing flush/reset sequence still runs, preserving the per-#489 stale-state mitigation. -
+  generate_sample plumbs plugin and open_gui through to render_params. - writers._render_in_batches
+  branches on reload_plugin_every_render: False loads the plugin and applies the preset once per
+  shard, holds the instance across all renders, and threads open_gui to that single load —
+  eliminating the ~7s plugin-load overhead per sample (#705). True preserves the historical
+  per-render reload.
+
+Tests: - TestLoadPluginOpenGui in tests/data/vst/test_core.py asserts the open_gui kwarg gates the
+  show_editor warm-up on non-Darwin and remains a no-op on Darwin. - TestRenderParamsPreloadedPlugin
+  pins the cached-plugin bypass. - test_render_in_batches_caches_plugin_when_reload_is_false /
+  ..._reloads_plugin_per_render_when_reload_is_true pin the writer- level lifecycle decision. - New
+  requires_vst equivalence test test_reload_per_render_matches_cached_plugin renders the same patch
+  N times each way and asserts audio-metric equivalence — the load-bearing safety check for #705's
+  load-once optimisation.
+
+Refs #705 Refs #1084
+
+* refactor(pipeline): replace lifecycle booleans with cadence literals
+
+The two RenderConfig flags introduced in PR #1084 were named in a way that broke down on the
+  cached-plugin path wired up in the previous commit: `open_gui_every_render` is a per-render
+  adjective but the cached path opens the GUI at most once per shard. This commit replaces the
+  booleans with cadence literals whose values are explicit about how often each lifecycle event
+  fires:
+
+- `reload_plugin_every_render: bool` → `plugin_reload_cadence: Literal["once", "render"] =
+  "render"`. - `open_gui_every_render: bool` → `gui_toggle_cadence: Literal["never", "once",
+  "render"]` with a platform-aware default factory ("never" on Darwin, "once" elsewhere). "once" is
+  the new safer default — one warm-up per shard rather than per render. The Darwin validator now
+  rejects only "render" because a single show_editor call sits below the empirical SIGTRAP threshold
+  (#714).
+
+`load_plugin` and `warmup_plugin` are now separate primitives in `data/vst/core.py`: `load_plugin`
+  only constructs the VST3 instance, and `warmup_plugin` runs the show_editor warm-up on a supplied
+  plugin. The Darwin-unconditional skip that used to live inside `load_plugin` moves to the schema
+  validator, so the cadence machinery can faithfully mean "call show_editor once on Darwin" when
+  configured to do so.
+
+`render_params` / `generate_sample` / `_generate_sample_for_index` swap their `open_gui` kwarg for
+  `warmup`. `_render_in_batches` reads the two cadence fields, holds a `warmup_done` flag across the
+  shard's render loop, and threads `warmup=<per-render decision>` into each sample generation. All
+  six (plugin_reload × gui_toggle) combinations are expressible and tested at the writer-loop level.
+
+Test fixtures across the project (pipeline conftests, validators, schema tests, generate_dataset
+  entrypoint tests, docker-entrypoint tests) move from `open_gui_every_render=False` to
+  `gui_toggle_cadence="never"`. The schema-level tests in
+  `tests/pipeline/test_schemas/test_dataset_spec.py` are rewritten to cover the new cadence default
+  matrix and Darwin rejection.
+
+The pydoclint baseline is regenerated to reflect the renamed attribute list in the existing
+  RenderConfig DOC603 row and the updated render_params DOC103 row — no rows added; net -4 rows
+  after picking up prior cleanups in models/components/embed_pool.py.
+
+This commit also folds in the small Tier-A review-polish items that naturally live with the rewrite:
+  shorter docstrings on the renamed APIs, identity-asserted captured plugins in the writer tests,
+  finite + non-silence guards on the requires_vst equivalence test, two extra writer-level tests
+  covering the new "once" and "never" gui cadences.
+
+* test(metrics): monkeypatch _current_platform in gui_toggle="render" writer test
+
+`test_render_in_batches_warmup_render_runs_every_render` constructs a `RenderConfig` with
+  `gui_toggle_cadence="render"`, which the darwin-rejection validator (#714) refuses on macOS hosts.
+  The existing schema-validator tests already monkeypatch
+  `synth_setter.pipeline.schemas.spec._current_platform` to "linux" to exercise the non-Darwin code
+  path; do the same here so the test runs identically on macos-latest and ubuntu-latest CI workers.
+
+Found via the macos-latest, 3.10 job on
+  https://github.com/tinaudio/synth-setter/actions/runs/26041089946
+
+Refs #1084
+
+* chore(metrics): clarify warmup_plugin log message
+
+The log message 'Preparing plugin for preset load...' was misleading: the warm-up runs after
+  load_preset in render_params, not before. Replace with a message describing the actual purpose
+  (show_editor commit-handler state nudge per #714).
+
+* fix(metrics): drop warmup after first attempt inside generate_sample
+
+The writer's gui_toggle_cadence="once" semantics expect at most one show_editor warm-up per shard,
+  but the loudness retry loop inside generate_sample forwarded warmup=warmup unchanged into
+  render_params on every iteration. A sample 0 that retried N times would call warmup_plugin N times
+  — silently breaking the once-per-shard budget and re-introducing the #714 Darwin SIGTRAP failure
+  mode when the user opts into gui_toggle_cadence="once" on Darwin.
+
+Setting warmup=False after the first render_params call pins warm-up to the first attempt regardless
+  of retries. Regression test test_generate_sample_warmup_only_applies_on_first_attempt asserts the
+  captured warmup args are [True, False] on a silent-then-loud render pair.
+
+Refs #714
+
+* chore(metrics): preserve historical non-Darwin warm-up via "render" default
+
+Per review feedback on PR #1084: this PR should be a config-knob-only change and not alter
+  production behaviour. The previous default "once" was a behaviour change — it took the historical
+  per-render warm-up off by default on non-Darwin. Flip ``_default_gui_toggle_cadence`` to return
+  ``"render"`` on non-Darwin so the default keeps the warm-up behaviour identical to pre-PR runs;
+  ``"once"`` remains available as opt-in. Darwin still defaults to ``"never"`` (the validator
+  rejects ``"render"`` per #714).
+
+Updates the schema docstring, the matching ``test_cadence_defaults_off_darwin`` assertion, and the
+  design-doc snippet to match.
+
+Refs #1084 Refs #705
+
+* test(metrics): strengthen warmup/cadence behavioral test coverage
+
+Replace the implementation-detail-pinning warmup test with parametrized behavioral tests that count
+  ``warmup_plugin`` invocations rather than asserting on the ``warmup=`` kwarg list. Adds matrix
+  gaps for cadence combos ``("once","once")`` and ``("once","render")`` plus writer-level cross-cuts
+  that let the real ``generate_sample`` run and stub at ``render_params``, catching a regression in
+  the retry-loop's ``warmup = False`` reset that pure kwarg-passthrough tests would miss.
+
+Mutation-verified by temporarily removing line 129's ``warmup = False``: the four invariant-pinning
+  tests (``test_generate_sample_warmups_once_regardless_of_retries[1|3]``,
+  ``test_render_in_batches_once_cadence_survives_intra_sample_retries``,
+  ``test_render_in_batches_render_cadence_warms_once_per_generate_sample_call``) all failed with the
+  bug present and passed once restored.
+
+Refs #1084 Refs #714 Refs #705
+
+### Internal-Feat
+
+- **pipeline**: Hydra-driven generate_dataset SkyPilot dispatch + CI migration
+  ([#1083](https://github.com/tinaudio/synth-setter/pull/1083),
+  [`2060b53`](https://github.com/tinaudio/synth-setter/commit/2060b53fe08bfd70ae9a48481bf5370b6ba4ef18))
+
+* internal-feat(pipeline): Hydra-driven generate_dataset SkyPilot dispatch
+
+Add a single user-facing entry point that composes the dataset cfg from sys.argv overrides and
+  dispatches the run either in-process (default) or via SkyPilot when
+  cfg.skypilot_launch.compute_template is set.
+
+- New SkypilotLaunchConfig Pydantic schema (compute_template / cmd / env_file / job_name /
+  num_workers / worker_image_tag / tail / api_server / local). - New
+  configs/skypilot_launch/default.yaml Hydra group; wired into dataset.yaml. - Split
+  synth_setter.cli.generate_dataset into: * main() — new console script
+  (synth-setter-generate-dataset), programmatic compose + branch on compute_template. * from_hydra()
+  — renamed @hydra.main entry, exposed as the new synth-setter-generate-dataset-from-hydra script
+  and invoked as the worker-side cmd. - New dispatch_via_skypilot(spec, sky_cfg) in
+  synth_setter.pipeline.skypilot_launch: loads the compute YAML, refuses to silently drop an
+  existing run: block when cmd is set, injects cmd as run:, and fans out per-rank via
+  sky.Task.from_yaml_config + existing helpers. - Click CLI in skypilot_launch.py is unchanged so
+  its existing tests/CI flow keep passing.
+
+Tests: SkypilotLaunchConfig validation, _load_compute_template_with_cmd cmd-vs-run conflict guard,
+  _detect_provider_from_doc, dispatch_via_skypilot happy path + failure modes, main() local vs
+  SkyPilot branches, _build_worker_cmd shell-quoting.
+
+Refs #922
+
+* review: address iteration-1 /repo-review-full-no-comments findings
+
+- Reject operator-supplied skypilot_launch.cmd in _sky_cfg_from_dataset_cfg (defense-in-depth: Hydra
+  struct-mode already rejects undeclared keys, but +skypilot_launch.cmd=... bypasses that — explicit
+  guard catches the injection surface the schema's cmd field exposes). - Trim
+  configs/skypilot_launch/default.yaml header (6 lines → 3) and the dispatch_via_skypilot ASCII
+  banner (12 lines → 1) per comment-hygiene. - Rewrite _build_worker_cmd's .rstrip() trick as an
+  explicit conditional join. - Trim _NON_SPEC_KEYS prose and the _REPO_ROOT 'parents[3] climbs ...'
+  enumeration.
+
+Tests: - TestBuildWorkerCmd.test_cmd_handles_empty_overrides now pins cd-prefix + exec-segment + no
+  trailing whitespace. -
+  TestMainDispatchBranches.test_compute_template_set_calls_dispatch_via_skypilot asserts every
+  override (not just experiment=...) round-trips into the worker cmd; new
+  test_operator_supplied_cmd_is_rejected pins the +-override guard. - Replace lambda+generator-throw
+  run-stub with a named _run_must_not_fire helper. - TestDetectProviderFromDoc collapses to a single
+  parametrized happy-path test covering runpod, oci, kubernetes, k8s alias, and case-insensitive
+  matching. - TestDispatchViaSkypilot gains: * test_multi_worker_fans_out_one_task_per_rank
+  (per-rank fan-out + env injection with num_workers=3), *
+  test_input_validation_raises_before_disk_or_network (parametrized job_name + worker_image_tag
+  malformed inputs), * test_api_server_and_local_are_mutually_exclusive, *
+  test_missing_worker_env_raises now monkeypatches.delenv each _SECRET_WORKER_ENV_KEYS rather than
+  relying on the autouse stripper. - Schema validation tests now parametrize over multiple bad
+  inputs (0/-1/-100 for num_workers; '', ' ', '\t\n' for api_server) and pin the offending field
+  name in the extra-fields-rejected error.
+
+* review: address iteration-2 /repo-review-full-no-comments findings
+
+Comment-hygiene trims: - from_hydra docstring: 6 lines → 1 line (was essay-restating main's
+  docstring). - dispatch_via_skypilot docstring: 25 lines → 9 lines (drop 6-step numbered procedure
+  that restated the function body; keep caller invariants + raises). - main docstring: drop
+  redundant final paragraph restating the if/else branch. - SkypilotLaunchConfig class docstring: 7
+  lines → 1 line. - Schema module docstring: 11 lines → 5 lines. - Trim 'paths.*' workaround comment
+  from 5 lines to 2. - Trim 'sky+click pull in heavy provider SDKs' second clause (redundant).
+
+Test contracts: - test_compute_template_null_calls_run_locally now asserts isinstance(spec,
+  DatasetSpec) and that spec.render.plugin_path round-trips, instead of just pinning that run was
+  called. - test_operator_supplied_cmd_is_rejected now monkeypatches both gd.run and
+  dispatch_via_skypilot to AssertionError-raising stubs so a future regression that flips the guard
+  order is caught. - test_yaml_run_block_conflicts_with_cmd asserts
+  mock_sky.jobs.launch.assert_not_called() to pin the no-side-effect half of the conflict-guard
+  contract. - New test_job_name_falls_back_to_task_name_prefix_when_unset covers the base_job_name
+  derivation branch when sky_cfg.job_name=None.
+
+* review: drop banner above dispatch_via_skypilot section
+
+iter-3 comment-hygiene flagged the C9 decorative banner above dispatch_via_skypilot as out-of-style
+  for src/synth_setter/pipeline/skypilot_launch.py (no other banner separators exist in that file).
+  The test files have established banner conventions per their existing 7-banner pattern, so banners
+  there are kept for local-style consistency.
+
+* internal-feat(ci): drive generate-dataset-shards via synth-setter-generate-dataset
+
+Migrate the reusable `.github/workflows/generate-dataset-shards.yaml` from the click CLI (`python -m
+  synth_setter.pipeline.skypilot_launch`) to the Hydra-first `synth-setter-generate-dataset`
+  entrypoint introduced earlier in this PR. The skypilot-local and runpod rows now drive dispatch
+  through `skypilot_launch.*` Hydra overrides; OCI keeps the click CLI because its sub-docker
+  template `run:` block (forced by the OCI backend's rejection of `image_id: docker:<image>`) can't
+  be replaced by the new dispatch's cmd injection without further work.
+
+To make the migration actually work end-to-end:
+
+- Anchor `_build_worker_cmd`'s `cd` target on the worker image's WORKDIR
+  (`/home/build/synth-setter`), not the launcher's `_REPO_ROOT`. The two paths only coincide when
+  the launcher itself runs inside dev-snapshot; for the skypilot-local row the launcher runs on the
+  bare GH-actions runner and `_REPO_ROOT` resolves to `/home/runner/...`, which doesn't exist on the
+  kind worker pod. - Inline `bash scripts/sync_worker_checkout.sh` into the worker cmd so PR-CI
+  workers fetch the PR head over the image-baked checkout (the bake-lag bypass the existing
+  templates' `run:` blocks did manually). - Strip the `run:` block from
+  `configs/compute/local-template.yaml` and `configs/compute/runpod-template.yaml` —
+  `_load_compute_template_with_cmd` refuses to silently shadow a template's existing `run:` when the
+  dispatcher has a `cmd` to inject. `oci-cpu-template.yaml` keeps its `run:` (the OCI sub-docker
+  shim). - Materialize the spec via `synth_setter.pipeline.ci.materialize_spec` before dispatch so
+  the downstream `Compute spec_uri output` step still has an `input_spec.json` from which to read
+  `r2_bucket`.
+
+Tests: extend `TestBuildWorkerCmd` with two assertions pinning the new cd target and the
+  sync-before-exec ordering.
+
+* internal-fix(pipeline): pin worker created_at + ${WORKER_CMD} substitution for OCI
+
+Two fixes that together let every provider in generate-dataset-shards.yaml drive the new Hydra
+  entrypoint:
+
+1) `_build_worker_cmd(overrides, spec)` now injects
+  `+created_at='<launcher_spec.created_at.isoformat()>'` into the worker overrides. Without it, the
+  worker's `from_hydra` re-compose hits `DatasetSpec.created_at`'s `default_factory=lambda:
+  _utc_now()` and lands on a different `r2_prefix` than the launcher's spec — the cause of the
+  `validate-shards` failures on the prior CI run (launcher spec wrote
+  `data/smoke-shard/smoke-shard-20260518T130455778Z/`, worker uploaded to
+  `data/smoke-shard/smoke-shard-20260518T130800988Z/`). `run_id` and `r2_prefix` derive from
+  `created_at` in `DatasetSpec`'s default factories, so pinning just that one field is sufficient.
+
+2) `_load_compute_template_with_cmd` gains a third branch: if the template's existing `run:` block
+  contains the literal `${WORKER_CMD}` sentinel, the launcher's cmd substitutes into the sentinel
+  and the surrounding shell scaffolding survives. Without the sentinel, a non-empty `run:` still
+  refuses (unchanged). `configs/compute/oci-cpu-template.yaml`'s sub-docker `run:` now uses `bash -c
+  "${WORKER_CMD}"`, which means OCI runs the same `synth-setter-generate-dataset` flow as runpod /
+  skypilot-local — the OCI workflow row in `generate-dataset-shards.yaml` folds back into the runpod
+  row, both calling `synth-setter-generate-dataset` with
+  `skypilot_launch.compute_template=configs/compute/<provider>-template.yaml`.
+
+Tests:
+
+- `TestBuildWorkerCmd::test_cmd_pins_spec_created_at_via_hydra_override` — the pinned `+created_at=`
+  override appears in the worker cmd. -
+  `TestLoadComputeTemplateWithCmd::test_sentinel_in_run_block_substitutes_cmd` — the
+  sentinel-substitution path lands cmd in place and leaves surrounding scaffolding intact. -
+  `TestLoadComputeTemplateWithCmd::test_existing_run_block_without_sentinel_raises` — refusal path
+  renamed and still active. - `TestLoadComputeTemplateWithCmd::test_non_string_run_block_raises` —
+  malformed templates raise before substitute attempts.
+
+* chore(comments): tighten comment hygiene across the dispatch + workflow surface
+
+Sweep of new/modified comments and docstrings against the project's comment-hygiene rules:
+
+- Drop multi-paragraph essays from module/function docstrings where the rationale was either already
+  in the code or task-stale ("Mirrors X / Lives at module level so tests can exercise it" patterns).
+  - Collapse 17- and 7-line comment blocks (e.g. the module docstring of
+  src/synth_setter/cli/generate_dataset.py and the _WORKER_REPO_ROOT header) into the WHY-only lines
+  that aren't already obvious from the code. - Compress the runpod / local / oci compute-template
+  headers — the prior versions restated facts that _load_compute_template_with_cmd already enforces
+  in code (no-`run:` / sentinel / refuse). - Trim docstring restatements in the matching test files.
+
+Net diff: −195 / +120 across 9 files; load-bearing WHY-comments (the `created_at` pinning rationale
+  in _build_worker_cmd, the OCI template's cloud-init / apt-lock setup notes, and the workflow's
+  20-min SIGKILL note) are preserved. No code or behavior changes.
+
+make format clean; tests/pipeline + tests/tools 577 passed / 4 skipped.
+
+
 ## v5.1.1 (2026-05-18)
 
 ### Bug Fixes
