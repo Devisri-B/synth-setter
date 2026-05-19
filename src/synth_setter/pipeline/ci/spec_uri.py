@@ -35,7 +35,7 @@ _EXIT_MISSING_FILE = 2
 _EXIT_INVALID_SPEC = 3
 
 
-def compute_spec_uri(spec_path: Path, cluster_name: str) -> str:  # noqa: DOC203
+def compute_spec_uri(spec_path: Path, cluster_name: str) -> str:
     """Read ``spec_path`` and return the launcher's R2 URI for ``cluster_name``.
 
     The URI follows the launcher's own convention exactly so the worker

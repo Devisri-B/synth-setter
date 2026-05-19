@@ -122,8 +122,11 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _current_platform() -> str:  # noqa: DOC201,DOC203
-    """Return ``sys.platform`` via a patchable indirection (tests patch this, not ``sys``)."""
+def _current_platform() -> str:
+    """Return ``sys.platform`` via a patchable indirection (tests patch this, not ``sys``).
+
+    :return: Current ``sys.platform`` string.
+    """
     return sys.platform
 
 
@@ -131,11 +134,13 @@ _GuiToggleCadence = Literal["never", "once", "render"]
 _PluginReloadCadence = Literal["once", "render"]
 
 
-def _default_gui_toggle_cadence() -> _GuiToggleCadence:  # noqa: DOC201,DOC203
+def _default_gui_toggle_cadence() -> _GuiToggleCadence:
     """Return ``"never"`` on Darwin (validator rejects ``"render"`` — #714), else ``"render"``.
 
     Non-Darwin keeps the historical per-render warm-up so this config switch
     doesn't change production behaviour; ``"once"`` is opt-in.
+
+    :return: ``"never"`` on Darwin, otherwise ``"render"``.
     """
     return "never" if _current_platform() == "darwin" else "render"
 
@@ -243,11 +248,14 @@ class RenderConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _gui_toggle_cadence_forbids_render_on_darwin(self) -> RenderConfig:  # noqa: DOC201,DOC203,DOC501,DOC503
+    def _gui_toggle_cadence_forbids_render_on_darwin(self) -> RenderConfig:
         """Reject ``gui_toggle_cadence="render"`` on Darwin (SIGTRAP after ~3-4 calls, #714).
 
         ``"once"`` is permitted because a single ``show_editor`` call sits below
         the empirical SIGTRAP threshold.
+
+        :return: ``self`` unchanged when the combination is permitted.
+        :raises ValueError: ``gui_toggle_cadence="render"`` combined with Darwin.
         """
         if self.gui_toggle_cadence == "render" and _current_platform() == "darwin":
             raise ValueError(
@@ -270,7 +278,7 @@ def _default_run_id(data: dict[str, Any]) -> str:
     )
 
 
-def _default_r2_location(data: dict[str, Any]) -> dict[str, Any]:  # noqa: DOC203
+def _default_r2_location(data: dict[str, Any]) -> dict[str, Any]:
     """Build a partial ``r2`` dict (no ``bucket``) when the ``r2`` field was omitted.
 
     The DatasetSpec model_validator promotes the legacy flat keys and fills
@@ -294,7 +302,7 @@ def _default_r2_location(data: dict[str, Any]) -> dict[str, Any]:  # noqa: DOC20
     }
 
 
-def _coerce_created_at_to_datetime(value: Any) -> datetime | None:  # noqa: DOC203
+def _coerce_created_at_to_datetime(value: Any) -> datetime | None:
     """Best-effort parse of ``created_at`` for pre-validation prefix derivation.
 
     The ``mode='before'`` model validator sees raw input — Python datetimes for
@@ -320,9 +328,7 @@ def _coerce_created_at_to_datetime(value: Any) -> datetime | None:  # noqa: DOC2
     return parsed
 
 
-def _fill_default_r2_prefix(  # noqa: DOC203
-    data: dict[str, Any], r2: dict[str, Any]
-) -> dict[str, Any]:
+def _fill_default_r2_prefix(data: dict[str, Any], r2: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``r2`` with ``prefix`` derived from layout fields when missing.
 
     Mirrors the prior ``_default_r2_prefix`` factory exactly:
@@ -361,7 +367,7 @@ def _fill_default_r2_prefix(  # noqa: DOC203
     return filled
 
 
-def _can_derive_prefix(data: dict[str, Any], r2: dict[str, Any]) -> bool:  # noqa: DOC203
+def _can_derive_prefix(data: dict[str, Any], r2: dict[str, Any]) -> bool:
     """Return True when layout fields can produce a derived ``prefix`` cleanly.
 
     Defers cases that would otherwise trip ``make_r2_prefix`` (blank task_name,
@@ -474,7 +480,7 @@ class DatasetSpec(BaseModel):  # noqa: DOC601,DOC603
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_r2_input(cls, data: Any) -> Any:  # noqa: DOC203
+    def _normalize_r2_input(cls, data: Any) -> Any:
         """Promote legacy flat ``r2_bucket`` / ``r2_prefix_root`` / ``r2_prefix`` into ``r2``.
 
         Back-compat shim for materialized ``input_spec.json`` files already

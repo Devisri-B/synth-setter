@@ -19,8 +19,11 @@ from synth_setter.schemas._types import NonBlankStr, StrictAllowExtraModel
 __all__ = ["TrainConfig"]
 
 
-def _default_tags() -> list[str]:  # noqa: DOC201,DOC203
-    """Return the placeholder ``["dev"]`` tag list."""
+def _default_tags() -> list[str]:
+    """Return the placeholder ``["dev"]`` tag list.
+
+    :return: Single-element list ``["dev"]``.
+    """
     return ["dev"]
 
 
