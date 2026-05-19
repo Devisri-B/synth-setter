@@ -1,6 +1,114 @@
 # CHANGELOG
 
 
+## v5.5.1 (2026-05-19)
+
+### Bug Fixes
+
+- **eval**: Predict_vst_audio UnboundLocalError when target params present without -t
+  ([#1148](https://github.com/tinaudio/synth-setter/pull/1148),
+  [`651d061`](https://github.com/tinaudio/synth-setter/commit/651d0619f3bf3ae515307604616886e40be6c5e1))
+
+* fix(eval): bind target_synth/note_params before params_to_csv call site
+
+`predict_vst_audio.main` raised `UnboundLocalError` when `target-params-{i}.pt` was present on disk
+  and `--rerender_target` was NOT passed: `target_synth_params` / `target_note_params` were only
+  bound inside the rerender branch, but the `params_to_csv` call site referenced them via
+  `target_synth_params if target_params is not None else None`.
+
+Fix: initialize both to `None` at the top of each row iteration. Two-line source change; behavior
+  preserved for both rerender and no-target paths.
+
+Refs #672
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* docs(test): drop stale UnboundLocalError workaround note now that #672 is fixed
+
+The block comment described `-t` as a workaround for the `UnboundLocalError` in
+  `predict_vst_audio.main`. That bug is fixed in the same PR (#672), so the workaround sentence is
+  no longer accurate. Kept the first sentence describing what `-t` does; left the test using `-t`
+  since it still validates re-rendering.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Chores
+
+- **dev**: Add pytest-cov[toml] to dev extras
+  ([#1147](https://github.com/tinaudio/synth-setter/pull/1147),
+  [`8122b9a`](https://github.com/tinaudio/synth-setter/commit/8122b9ab4703b6a7b9c415831787c2a52f88faf9))
+
+Coverage runs (`make coverage`, the test.yml job, and ad-hoc local runs) all need `pytest-cov`, but
+  it was never in the `dev` optional dependency set — both the Makefile coverage target and the test
+  workflow had to `pip install` it inline on every invocation.
+
+Move it into `[project.optional-dependencies].dev` so `pip install -e ".[dev]"` is enough, and drop
+  the redundant inline installs from both call sites.
+
+Refs #211
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Continuous Integration
+
+- **pipeline**: Drop unused pydantic install from r2-auth-probe
+  ([#1146](https://github.com/tinaudio/synth-setter/pull/1146),
+  [`7b74202`](https://github.com/tinaudio/synth-setter/commit/7b742028f3e1c154b54e3411f1c8d1bbd0354fa6))
+
+`ensure_r2_env_loaded` only imports `python-dotenv` (and stdlib + the project's
+  `pipeline.constants`). It does not pull in pydantic — verified by blocking pydantic from
+  `sys.meta_path` and importing the entry point cleanly. The install step inherited pydantic from
+  `validate-dataset-shards.yaml`'s mirror, but that workflow needs pydantic because `validate_spec`
+  imports `pipeline.schemas.spec`, which loads pydantic at module top. The probe doesn't go through
+  that path.
+
+Drops the unused install and rewrites the step comment so it doesn't claim `ensure_r2_env_loaded`
+  imports pydantic directly.
+
+Addresses Copilot review comments on PR #1145
+  (https://github.com/tinaudio/synth-setter/pull/1145#discussion_r3268118962,
+  https://github.com/tinaudio/synth-setter/pull/1145#discussion_r3268163804).
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Documentation
+
+- **skills**: Allow /repo-review-full-no-comments to run without a PR
+  ([#1149](https://github.com/tinaudio/synth-setter/pull/1149),
+  [`6f2c680`](https://github.com/tinaudio/synth-setter/commit/6f2c680695e65c04127fe50dde6d37f398232aa3))
+
+* docs(skills): allow repo-review-full-no-comments to run without a PR
+
+Add a local-branch mode to /repo-review-full-no-comments so it can run as a pre-PR gate (e.g. before
+  `gh pr create`). When no PR exists for the current branch, the skill derives head/base SHAs and
+  the file list from local git against the repo's default branch instead of `gh pr view`.
+  GitHub-side health checks (mergeable, statusCheckRollup) are skipped with a one-line caveat in the
+  review body. Steps 3-6 in the shared analysis pipeline remain unchanged.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* docs: update AGENTS.md + repo-review-full pointer for local-branch mode
+
+doc-drift fixups from PR #1149:
+
+- AGENTS.md: extend the /repo-review-full-no-comments bullet to mention the new local-branch /
+  pre-PR mode. - agent/skills/repo-review-full/SKILL.md: soften "runs the same Steps 1-6" to reflect
+  that no-comments now owns Steps 1-2 itself and only delegates Steps 3-6 to the shared analysis
+  file.
+
+Refs #1072
+
+* Potential fix for pull request finding
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+
 ## v5.5.0 (2026-05-19)
 
 ### Documentation
