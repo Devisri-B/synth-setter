@@ -1,6 +1,71 @@
 # CHANGELOG
 
 
+## v8.4.0 (2026-05-20)
+
+### Features
+
+- **data-pipeline**: Wire editor_held_open into _render_in_batches for always_on
+  ([#1192](https://github.com/tinaudio/synth-setter/pull/1192),
+  [`c34c92e`](https://github.com/tinaudio/synth-setter/commit/c34c92ea4d92552e0d8d5c5ef6537c9678295639))
+
+* feat(data-pipeline): wire editor_held_open into _render_in_batches for always_on
+
+Replace the Wave 1 ``NotImplementedError`` guard with the held-open editor implementation:
+
+- Add ``editor_held_open(plugin)`` context manager in ``data/vst/core.py``. Runs
+  ``plugin.show_editor(close_event)`` on a daemon background thread; on ``__exit__`` sets the event,
+  joins the thread (bounded by ``_EDITOR_JOIN_TIMEOUT_SECONDS = 2.0``), and re-raises any exception
+  the editor thread captured (already logged at the moment of failure via ``logger.exception``). -
+  ``_render_in_batches`` wraps the shard loop in ``editor_held_open(cached_plugin) if hold_open else
+  nullcontext()`` so every legacy cadence keeps the no-context-manager path. - Strip the Wave 1
+  transient note from the field description (the schema description is now accurate at runtime). -
+  Three new ``TestEditorHeldOpen`` unit tests (opens-and-closes, log + re-raise on editor crash,
+  join-timeout-no-deadlock) plus two writer tests (always_on enters held-open scope with cached
+  plugin; legacy cadences leave it untouched). - Refresh the pydoclint baseline entry for
+  ``render_params`` whose parameter types were normalised to PEP 604 (``Optional`` → ``| None``,
+  ``Tuple`` → ``tuple``) by ruff's UP autofixer when the unused legacy typing imports were removed.
+
+Refs #1187
+
+* fix(data-pipeline): tighten editor_held_open per review feedback
+
+Address Wave 2 review WARNs/BLOCK:
+
+- Narrow ``except BaseException`` to ``except Exception`` so KeyboardInterrupt / SystemExit
+  propagate naturally through the editor thread. - Add ``logger.warning`` when
+  ``editor_thread.is_alive()`` after the bounded join — closes the silent-leak observability gap
+  (was a join-timeout-and- forget). - Replace the defensive ``cached_plugin is not None`` ternary in
+  ``_render_in_batches`` with an explicit ``RuntimeError`` that names the responsible validator. A
+  future regression that loosens the schema gate now fails loud instead of silently falling back to
+  ``nullcontext()``. - Tighten the join-timeout test to also assert the leak-warning fires, pinning
+  the new observability behaviour.
+
+Refs #1191
+
+* fix(data-pipeline): body-exception wins in editor_held_open + broaden cadence test
+
+Address Wave 2 Copilot review comments:
+
+1. ``editor_held_open`` no longer masks a body-exception when the editor thread also raised. Use
+  ``sys.exc_info()`` inside ``finally`` to detect the body-exception case and surface the captured
+  editor exception only when the body succeeded — re-raising during an active body exception would
+  clobber it (raise-in-finally wins). When both raise, the editor crash is recorded via
+  ``logger.error`` so it is not lost. 2. New ``test_body_exception_wins_over_editor_exception`` pins
+  the precedence rule and the structured-error-log fallback. 3. Broaden
+  ``test_render_in_batches_non_always_on_does_not_open_held_open_scope`` to parametrize over
+  ``never`` / ``once`` / ``render`` so the docstring ("every legacy cadence leaves editor_held_open
+  untouched") matches the assertions.
+
+* fix(testing): pin platform in non_always_on cadence parametrize
+
+The cadence parametrize added in 6eefcac includes ``"render"``, which the Darwin gate validator
+  (#714) rejects at ``RenderConfig`` construction. The test was passing on Linux runners but failing
+  on the macOS matrix job. Monkeypatch ``_current_platform`` to ``"linux"`` so the test exercises
+  all three cadences on every runner — the writer wiring it covers is platform-agnostic; the
+  validator gate is exercised separately in ``tests/pipeline/test_schemas/test_dataset_spec.py``.
+
+
 ## v8.3.0 (2026-05-20)
 
 ### Features
