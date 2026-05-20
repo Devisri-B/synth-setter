@@ -1,6 +1,567 @@
 # CHANGELOG
 
 
+## v7.0.0 (2026-05-20)
+
+### Chores
+
+- **automation**: Isolate pr-review-resolver / doc-drift in detached worktrees
+  ([#1177](https://github.com/tinaudio/synth-setter/pull/1177),
+  [`8acbdac`](https://github.com/tinaudio/synth-setter/commit/8acbdac1bd1d555c49ee72764e7a7306bdb33136))
+
+* test(hooks): add failing tests for worktree isolation, branch-explicit PR lookup, stamped rewake
+
+Pin the cascade-bug fixes from the hook routing issue:
+
+- worktree isolation: headless agent's PWD must be under .agent-reviews/worktrees/ and HEAD must
+  match captured sandbox HEAD - report path: pr-review-resolver-*.md and doc-drift-*.md must land at
+  depth 1 in main repo .agent-reviews/ even when the hook ran from a separate worktree - worktree
+  cleanup: EXIT trap must remove the worktree after hook exits - rewake stderr: must stamp PR /
+  branch / origin HEAD short SHA and include a 'crossed sessions' caveat - gh pr view: must be
+  invoked with the captured branch as an explicit arg - bail short-circuits: main / no-PR paths must
+  not create a worktree - stale sweep: leaked resolver-* worktrees older than 30 minutes get cleaned
+  on hook start - AGENT_TIMEOUT_SECS: bounds the headless agent so a hung run exits 124 and surfaces
+  as a FAILED report
+
+Stubs extended: claude records PWD + HEAD and honours CLAUDE_STUB_SLEEP_SECS; gh appends argv to
+  GH_STUB_LOG. reset_sandbox now drops leftover git-worktree registrations between tests.
+
+* fix(hooks): isolate pr-review-resolver and doc-drift in detached worktrees
+
+The asyncRewake PostToolUse hooks pr-review-resolver.sh and doc-drift.sh spawn a headless
+  claude/codex agent that, until now, ran in the user's primary checkout. If the prompt asked it to
+  switch branches (or if the resolver's PR resolution drifted during its 6-minute sleep, see Bug 1
+  below), the headless agent would 'git checkout <other-branch>' inside the active session's
+  worktree mid-edit. Cascade observed on PR #1163: the resolver, fired from a fix/hook-bugs-1158
+  push, computed PR #1163 against a different branch and instructed the headless agent to switch
+  branches, fix, push, and switch back — all in the user's main worktree.
+
+This patch lands four coordinated fixes:
+
+1. Worktree isolation. Each hook now allocates a detached git worktree pinned to the captured HEAD
+  via new make_isolated_worktree(), cds there, and runs the headless agent from inside. An EXIT trap
+  calls remove_worktree() so the registration is cleaned even on set -e aborts;
+  sweep_stale_worktrees() at hook start removes leaks the trap missed (e.g. when the harness
+  SIGKILL'd at its timeout ceiling).
+
+2. Branch-explicit PR resolution. gh pr view replaces the bare gh pr view, so PR/BRANCH can never
+  drift apart between hook start and headless agent invocation.
+
+3. Absolute REVIEWS_DIR. _lib.sh resolves .agent-reviews/ and .hook.log via git rev-parse
+  --git-common-dir, so reports and the lockfile land in the main repo regardless of where the hook
+  cd'd. Without this, isolation would write reports inside the temp worktree and the trap'd cleanup
+  would delete them before the receiving session could read.
+
+4. Stamped rewake stderr. The advisory pointer now carries 'PR #N (branch X, origin HEAD <sha7>)'
+  and a 'crossed sessions' caveat, so a session that receives a cross-session leak can git rev-parse
+  HEAD and discard.
+
+run_agent_prompt() now wraps the CLI in timeout AGENT_TIMEOUT_SECS (default 900s); a hung headless
+  agent surfaces as exit 124 → FAILED report, not as a hang the harness must SIGKILL. Bails
+  (main/master, no-PR) are evaluated before worktree creation so they cost nothing.
+
+All 43 hook tests pass, including the 11 new ones pinning the four fixes.
+
+* docs(agents): document origin-HEAD stamp on advisory rewakes
+
+The pr-review-resolver and doc-drift hooks now stamp their asyncRewake stderr with the captured
+  origin HEAD short SHA. A session that receives a cross-session leak (advisory fired by a prior
+  session that finished after its hook started) can detect it in one git rev-parse HEAD check and
+  discard instead of treating the advisory as work for the current PR.
+
+* refactor(hooks): tighten simplify-pass findings
+
+Five small cleanups surfaced by the parallel reuse / quality / efficiency review:
+
+- has_skill() no longer recomputes the main-repo root; it consumes the cached $_REPO_ROOT_FOR_HOOKS
+  that _lib.sh sets at source time. One git call per hook invocation instead of two. -
+  emit_rewake_stamp() extracted into _lib.sh. The two hooks shared the verbatim 'origin HEAD <sha>'
+  + 'crossed sessions' caveat printf; AGENTS.md treats the wording as load-bearing, so a single
+  source prevents drift. - ensure_reviews_dir + sweep_stale_worktrees moved past the no-PR bail in
+  both hooks. Pushes to a no-PR branch no longer pay the mkdir + find -mmin scan. - timeout
+  --kill-after=10 added to the run_agent_prompt wrap so a child ignoring SIGTERM (or grandchildren
+  the CLI spawned) gets SIGKILL'd ten seconds after the soft timeout instead of hanging until the
+  harness ceiling. - A handful of comments compressed to the CLAUDE.md 1-2 line cap.
+
+All 43 shell hook tests and 110 Python settings_hooks tests still pass.
+
+* docs(claude-hooks): apply doc-drift findings on PR #1177
+
+The doc-drift advisory (origin HEAD 8515e46) flagged three items:
+
+1. .claude/settings.json descriptions for both doc-drift and pr-review-resolver still described the
+  pre-isolation flow — no mention of worktree isolation, AGENT_TIMEOUT_SECS, or the resolver's new
+  bail-before-sleep ordering. Updated both to reflect actual behavior so operators reading
+  settings.json see the contract. 2. AGENT_TIMEOUT_SECS=900 + --kill-after=10 +
+  RESOLVER_SLEEP_SECS=360 summed to 1270s, exceeding the resolver harness ceiling of 1200s by 70s
+  (and the doc-drift hook's 900s ceiling by 10s). Lowered the default to 800s so worst-case fits
+  both harness budgets (810s for doc-drift, 1170s for the resolver). Operators raising the env var
+  must verify the matching settings.json timeout field; documented in the function comment. 3.
+  Hook-script header lines that mentioned 'default 900s' updated to match the new 800s default.
+
+All 43 hook tests + 110 settings-hooks tests still pass.
+
+* fix(hooks): address Copilot review on PR #1177
+
+- _lib.sh: probe `timeout`, fall back to `gtimeout`, then to an unwrapped run with a log line.
+  Restores the hook on macOS where GNU coreutils ships `timeout` as `gtimeout` (or is absent
+  entirely). - pr-review-resolver.sh: brief the headless agent on the detached worktree — do not
+  `git checkout <branch>` (already checked out in the user's main worktree), push fixes back with
+  `git push origin HEAD:<branch>`. - AGENTS.md: receiver-side stamp check now reads `git rev-parse
+  --short=7 HEAD` so the prefix matches the advisory's 7-char SHA.
+
+`bash agent/hooks/test.sh` → 43 PASS, 0 FAIL.
+
+* Apply suggestions from code review
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+* chore(format): mdformat AGENTS.md advisory-rewake paragraph
+
+---------
+
+- **ci-automation**: Small-wins cleanup bundle for test-dataset-generation orchestration
+  ([#1167](https://github.com/tinaudio/synth-setter/pull/1167),
+  [`29e4697`](https://github.com/tinaudio/synth-setter/commit/29e4697af84671bab0a7ff496f21cc58519c50ac))
+
+* chore(ci-automation): tighten test-dataset-generation orchestration (A5 + A6 + B2 + B5 + C3)
+
+Refs #1164.
+
+A5: move the managed-jobs controller shrink into the launcher under SYNTH_SETTER_CI_MODE=1; delete
+  the per-run YAML-write step from generate-dataset-shards.yaml.
+
+A6: launcher emits the canonical spec URI on a stdout sentinel
+
+(::synth-setter-spec-uri::r2://...); the workflow greps the tee'd generate.log instead of
+  re-shelling out to synth-setter-spec-uri (which required a host-side pip install -e . for the
+  runpod/oci rows).
+
+B2: merge the two Hydra-compose blocks in test-dataset-generation.yml's setup job into one step that
+  emits providers, output_formats, and r2_bucket from a single compose call.
+
+B5: harden the concurrency group for workflow_dispatch so a re-dispatch to the same ref doesn't
+  cancel the in-flight intentional run; PR/push coalescing is unchanged.
+
+C3: cache ~/.cache/pip on validate-dataset-shards.yaml's validate-spec job (inline install —
+  actions/cache keyed on the workflow file hash).
+
+* test(infra): update dataset-generation-matrix tests for merged compose step
+
+After the B2 merge in this PR, the two `id: matrix` / `id: bucket` steps collapsed into a single
+  `id: compose` step. Update the static-YAML assertions and rename the second test to
+  `test_setup_compose_step_branches_on_event_name`; reference the new variable names
+  (`DATASET_CONFIG` / `COMPOSED_FORMAT`) replacing the old `DISPATCH_DATASET_CONFIG` /
+  `DISPATCH_FORMAT`.
+
+* docs(ci-automation): update for launcher CI-mode shrink + stdout spec_uri
+
+Doc-drift fixes from #1167:
+
+- doc-map.yaml: update generate-dataset-shards.yaml `spec_uri` provenance (now grepped from the
+  launcher's `::synth-setter-spec-uri::` stdout sentinel); extend skypilot_launch.py `covers:` with
+  `_ensure_ci_sky_config` and `_emit_spec_uri`; correct write_provider_creds.sh `covers:` to
+  attribute the kind controller-shrink to the launcher's CI-mode hook. - github-actions.md: switch
+  the artifact-chain spec_uri attribution to the launcher sentinel; rewrite the Concurrency
+  subsection to acknowledge test-dataset-generation's group and the dispatch suffix change. -
+  configuration-reference.md: replace `synth-setter-spec-uri` console-script references with
+  `_resolve_spec_uri` + `_emit_spec_uri` (2 spots). - data-pipeline.md: same fix in the launcher
+  one-liner. - configs/compute/local-template.yaml + scripts/skypilot/write_provider_creds.sh:
+  attribute the controller-shrink write to the launcher CI-mode hook, not the workflow.
+
+Refs #1167
+
+* chore(ci-automation): address Copilot review on cleanup bundle
+
+- Move `_ensure_ci_sky_config` + `_emit_spec_uri` from the click `main()` into
+  `dispatch_via_skypilot` so both entrypoints fire them — the CI workflow runs
+  `synth-setter-generate-dataset` (cli/generate_dataset.py), which bypasses the click launcher
+  entirely. Without this, the CI-mode shrink and the spec-uri stdout marker were dead code on the
+  hot path. - Parse `SYNTH_SETTER_CI_MODE` explicitly (accept only {1, true, yes, on}
+  case-insensitively); "0"/"false"/etc. are now a no-op rather than triggering the kind-shrink
+  overwrite. - Add `|| true` to the `grep | sed` pipeline in the spec_uri extraction step so a
+  missing marker surfaces the friendly `::error::` message rather than silently exiting via `set
+  -euo pipefail`. - Tidy concurrency group: leading dash lives inside the conditional so PR/push
+  runs no longer leave a trailing `-` (group is byte-identical to the prior `${{ github.workflow
+  }}-${{ github.ref }}` key on PR/push). - Doc fixes: `_resolve_spec_uri` is described accurately as
+  shelling out to the `synth-setter-spec-uri` console script (out-of-process), and the concurrency
+  group description in `github-actions.md` now matches the actual expression.
+
+* chore(comment-hygiene): trim verbose doc / comment updates
+
+User feedback on PR #1167's doc churn: trim filler and current-task references introduced by the
+  cleanup bundle.
+
+- Drop `(PR #1167)` and `PR #1167/#876` currentness markers from
+  configs/compute/local-template.yaml, scripts/skypilot/write_provider_creds.sh, docs/doc-map.yaml
+  (skypilot_launch + write_provider_creds entries), and docs/reference/github-actions.md
+  (concurrency paragraph). - Trim the "out-of-process / same validator path" rationale on
+  `_resolve_spec_uri` parentheticals in docs/design/data-pipeline.md and
+  docs/reference/configuration-reference.md (diagram + bullet) to just "(shells out to the
+  `synth-setter-spec-uri` console script)". - Compress doc-map.yaml's `skypilot_launch.py` entry:
+  drop the (a)/(b) framing and "kind/CI smoke" parenthetical; keep the load-bearing facts
+  (dispatch_via_skypilot is the chokepoint for both entrypoints, when the CI shrink fires, what the
+  stdout sentinel looks like). - Trim the test-dataset-generation.yml concurrency-comment block to
+  drop the "byte-identical to the prior form" defense of the conditional dash. - Trim historical
+  narration ("per-run YAML write moved from …", "replacing the bash compose+install step …") from
+  `_ensure_ci_sky_config` / `_emit_spec_uri` docstrings.
+
+No behavior change — only inline comment / docstring / yaml-description content. All 77 launcher
+  tests still pass.
+
+* chore(ci-automation): comment-hygiene sweep + correct doc claims on PR #1167
+
+- docs: drop "in-process" wording for `_resolve_spec_uri` (it shells out to
+  `synth-setter-spec-uri`); doc-map / data-pipeline / config-reference all now match the
+  implementation. - docs: configuration-reference.md inner-command contract — explicit that the
+  inner command performs the R2 upload, not the launcher. - docs/reference/github-actions.md:
+  correct the false "Other CI workflows have no concurrency configured" claim; enumerate the 6 other
+  workflows that use `concurrency:`. - skypilot_launch.py: tighten the `_ensure_ci_sky_config` /
+  `_emit_spec_uri` module constants, docstrings, and dispatch-chokepoint comment. - doc-map.yaml:
+  trim `skypilot_launch.py` and `write_provider_creds.sh` covers entries. - local-template.yaml +
+  write_provider_creds.sh: tighten the `_ensure_ci_sky_config` cross-reference blurb.
+
+Refs #1167.
+
+* chore(docs): address remaining Copilot review nits on PR #1167
+
+Two doc-only fixes from the latest Copilot review round; the other four flagged comments were
+  auto-resolved when the merge with origin/main pulled in #1163 (ad-hoc launcher clarification),
+  #1168 (schedule-keyed setup), and the comment-hygiene PR-number cleanup.
+
+- docs/reference/github-actions.md: the concurrency paragraph still described the pre-#1168 scheme
+  keyed by `<workflow>-<ref>` for PR/push and `<workflow>-<ref>-<run_id>` for workflow_dispatch.
+  After the merge test-dataset-generation.yml uses `${{ github.workflow }}-${{ github.ref }}-${{
+  github.event.schedule || github.event_name }}` — rewrite the paragraph to describe that scheme and
+  why hourly and weekly cron ticks live in separate groups. -
+  docs/reference/configuration-reference.md: the ad-hoc-path diagram bullet read "runs the command
+  ... so it materializes ... and uploads it to R2", which contradicts the inner-command contract
+  immediately below ("the launcher itself does not upload"). Reword to attribute the upload to the
+  operator command explicitly.
+
+* test(ci): retarget dataset-generation-matrix tests at the post-#1168 setup.matrix step
+
+#1168 (e8e4bb9) restructured the test-dataset-generation.yml setup job: the former single `compose`
+  step is now `matrix` (providers + output_formats) and `bucket` (R2 bucket). The two assertions
+  that looked up `step_id="compose"` failed across the run_tests_* matrix (conda + ubuntu 3.10 /
+  3.11 + macos). Retarget them at the `matrix` step, replace the dropped `COMPOSED_FORMAT` reference
+  with `DISPATCH_FORMAT`, and refresh the docstring to describe the schedule + dispatch branches
+  (the pull_request trigger is gone — presubmit coverage moved to test-local-launcher-roundtrip.yml
+  in #1170).
+
+* chore(comment-hygiene): address 5 Copilot nits from 23:39 review round
+
+- tests/pipeline/test_entrypoints/test_skypilot_launch.py: trim the `TestEnsureCiSkyConfig` class
+  docstring to drop the historical "Replaces the per-run YAML write … (PR #1164)" narration (comment
+  3270338914). - .github/workflows/generate-dataset-shards.yaml: drop "per PR #1164" trailer from
+  the SYNTH_SETTER_CI_MODE comment block (3270338929). -
+  .github/workflows/validate-dataset-shards.yaml: "+ two pinned packages" → "+ two extra packages"
+  (only pydantic is pinned; python-dotenv isn't), and drop the trailing "PR #1164 (C3)." ref
+  (3270338937). - docs/reference/github-actions.md: rewrite the concurrency-section description for
+  test-dataset-generation so it matches the post-#1168 key shape — workflow_dispatch runs for the
+  same ref share one group (re-dispatch cancels prior); only schedule axes are split (3270338955). -
+  tests/infra/test_dataset_generation_matrix.py: realign the second setup-step test with the
+  workflow's actual `id: matrix` / `DISPATCH_FORMAT` / `schedule`-branch shape, and rename the
+  function from `test_setup_compose_step_branches_on_event_name` →
+  `test_setup_matrix_step_branches_on_event_name` so the name matches what's asserted (3270338972).
+
+All 598 pipeline/infra tests pass.
+
+- **claude-hooks**: Address post-merge Copilot findings on PR #1158
+  ([#1159](https://github.com/tinaudio/synth-setter/pull/1159),
+  [`cd75350`](https://github.com/tinaudio/synth-setter/commit/cd75350e4a4c95c568130fe0fde8b4d54adf8670))
+
+* fix(claude-hooks): address post-merge Copilot findings on PR #1158
+
+Three correctness items the auto-approver merged past:
+
+- .claude/settings.json: matcher-entry description claimed `.github/workflows/*.yml` or
+  `configs/compute/*.yaml`, but the hook's in_scope() accepts both extensions in both directories.
+  Document the real glob. - agent/hooks/no-baseline-additions.sh: the embedded Python emitted `note:
+  Edit old_string not found...` to stderr even on otherwise-allowed edits, polluting the
+  user-visible BLOCKED channel. Route the diagnostic through a `LOG:`-prefixed channel the wrapper
+  hands to log() — mirrors the pattern already used by no-yaml-run-comments.sh. -
+  agent/hooks/git_commit_trailer_check.py: trailer regexes anchor on `(?:^|\n|\\n)\s*` so
+  `m.group(0)` carried the leading newline/whitespace into the BLOCKED Findings block. Collapse
+  internal whitespace + strip before reporting so each finding renders as one tight line.
+
+Tests pin each fix: stderr stays empty when old_string is absent, findings have no embedded `\n`,
+  and the description references both `workflows/*.{yml,yaml}` and `compute/*.{yml,yaml}`.
+
+Refs #1158
+
+* test(claude-hooks): tighten review nits on regression tests
+
+Two minimal-impact WARN findings from the pre-PR review:
+
+- test_trailer_hook_finding_does_not_contain_embedded_newlines: precondition asserts on `Findings:`
+  / `Rules` markers so a future BLOCKED-message rename produces a focused AssertionError instead of
+  a stack-trace IndexError. - test_yaml_run_hook_description_documents_both_extensions: invoke
+  _find_handler first so the "exactly one matcher entry" invariant trips there with a clear message
+  if the description label is renamed, instead of a silent StopIteration on the inline next().
+
+No behavior change to the production hooks.
+
+* fix(claude-hooks): address Copilot review on follow-up PR #1159
+
+Two Copilot review threads on the post-merge-fix PR:
+
+- agent/hooks/no-baseline-additions.sh (3269592145): the embedded Python runs inside a `set -e`
+  shell, so a scanner crash on the `counts=$(...)` assignment would short-circuit the function
+  before the stderr replay loop ran — tracebacks would vanish into thin air. Wrap the assignment in
+  `set +e` / `scanner_exit=$?` / `set -e` so the replay always runs, then route a non-zero exit
+  through an explicit BLOCKED path. - tests/claude_hooks/test_settings_hooks.py (3269592192):
+  `test_trailer_hook_finding_does_not_contain_embedded_newlines` checked each line in the Findings
+  block for a raw \\n — but `splitlines()` already splits on \\n, so the assertion was tautological.
+  Replace it with a `\t` check that pins the actual `<label>\\t<match>` shape, so a multi-line
+  continuation (a regressed `re.sub` collapse) fails the assertion at the first hit.
+
+Mutation-checked: reverting the `re.sub(r"\\s+", " ", m.group(0)).strip()` collapse in
+  git_commit_trailer_check.py now produces `AssertionError: finding line missing label/match tab: '
+  Co-Authored-By:'` in the test; the previous form passed even with that regression in place.
+
+Refs #1159 Refs #1158
+
+### Continuous Integration
+
+- Move presubmit generate-dataset CI matrix with hourly + weekly schedules
+  ([#1168](https://github.com/tinaudio/synth-setter/pull/1168),
+  [`e8e4bb9`](https://github.com/tinaudio/synth-setter/commit/e8e4bb9b2c3c43fe16efc7e13c0b606b86c140e7))
+
+* perf(ci-automation): demote hdf5 to nightly, cache uv deps, parallel image pull
+
+PR runs of test-dataset-generation.yml drop the hdf5 matrix cell, cache the launcher venv across
+  runs, and overlap the worker `docker pull` with kind / Python setup. Together this targets ~14-16
+  min PR wall-clock, down from ~24 min (see #1164 for the audit).
+
+B1: pull_request matrix is now skypilot-local x wds only; hdf5 still
+
+runs daily via a new `schedule: cron 0 7 * * *` trigger that fans both hdf5 and wds back out.
+  r2-bucket + per-format experiment-config picks extended to cover the schedule event.
+
+A1: launcher install now writes to a workspace venv cached via actions/cache@v4 keyed on uv.lock +
+  pyproject.toml + the pinned skypilot[kubernetes] version. The venv bin is appended to GITHUB_PATH
+  so downstream `sky` / `synth-setter-generate-dataset` invocations resolve to it.
+
+A2: worker `docker pull` runs in the background while kind + uv install proceed. A new "Wait for
+  image pull" step polls an exit-code sentinel file before kind load / docker run, so a pull failure
+  still fails the workflow loudly.
+
+Refs #1164
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* refactor(ci-automation): simplify A2 background-pull bash quoting
+
+Replace the nested single/double-quote dance in the Pull image (background) step with step-env
+  passthrough (PULL_LOG / PULL_EXITCODE), and reuse the same env vars in the two Wait for image pull
+  steps. No behavior change.
+
+* docs(ci-automation): update for schedule trigger + wds-only PR axis
+
+Doc-drift fixes from the #1164 demotion of hdf5 to nightly:
+
+- test-dataset-generation.yml header: add `schedule` to the provider matrix policy bullet list -
+  docs/doc-map.yaml: extend `covers:` to mention PR=wds-only and the daily 07:00 UTC schedule
+  restoring hdf5 - docs/reference/github-actions.md: - Pipeline table: refresh the
+  test-dataset-generation row to use the actual `skypilot-local` enum and document the wds-on-PR /
+  schedule-on-hdf5+wds split - Scheduled table: add a row for the new daily test-dataset-generation
+  cron - Scheduled triggers subsection: add bullets for `nightly` and `test-dataset-generation`
+
+* docs(ci-automation): correct cached venv path in comment
+
+Comment referenced ~/.venv-launcher but the cache path and VENV variable both resolve to
+  $GITHUB_WORKSPACE/.venv-launcher. Aligning the comment with the actual location avoids confusion
+  when debugging cache behavior.
+
+* refactor(ci-automation): replace PR trigger with hourly + weekly schedules
+
+PR-presubmit coverage of the launcher / R2 round-trip moves to test-local-launcher-roundtrip.yml
+  (#1170), which runs in ~8-10 min on ubuntu-latest. The full launcher-on-kind path here was always
+  the wrong tool for per-PR signal — too heavy and too redundant — so this workflow becomes schedule
+  + dispatch only.
+
+Two schedule axes (selected by `github.event.schedule` in the setup job):
+
+* `0 * * * *` (hourly) — skypilot-local x {hdf5, wds}. Free coverage of the unified launcher / kind
+  / R2 path under near-continuous load, replacing what was previously a single 07:00 UTC nightly
+  tick. * `0 7 * * 0` (Sunday 07:00 UTC) — skypilot-local + runpod + oci x {hdf5, wds}. Only
+  paid-capacity touch outside manual dispatch; surfaces credential rot / backend regressions on the
+  cloud providers once a week.
+
+Concurrency group now mixes in `github.event.schedule` so an hourly tick can't cancel an in-flight
+  weekly all-providers run mid-flight. Within a single cron axis `cancel-in-progress: true` still
+  supersedes stuck prior runs.
+
+Unknown schedule crons fall through to an empty matrix with an explicit `::warning::` log so adding
+  a third cron without updating the dispatch fails loudly instead of silently running the wrong
+  axes.
+
+Refs #1164.
+
+* docs(ci-automation): sync test-dataset-generation references to hourly + weekly schedule
+
+Addresses copilot review on #1168: the previous commit moved the workflow from `pull_request` +
+  daily cron to `schedule`-only (hourly + weekly), but left three downstream surfaces stale.
+
+- docs/reference/github-actions.md: rewrite the Pipeline-table row, the Scheduled-workflows-table
+  row, and the Scheduled-triggers bullet to describe the hourly local + weekly all-providers crons
+  and the paid- capacity implications of the weekly axis. - docs/doc-map.yaml: rewrite the
+  `.github/workflows/test-dataset-generation.yml` coverage prose for the same reason. -
+  .github/workflows/test-dataset-generation.yml: soften the references to
+  `test-local-launcher-roundtrip.yml` from "moved to" to "moves to / lands via #1170" since that
+  workflow is added in an open PR, not yet merged.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+### Documentation
+
+- **claude-md**: Inline positive comment-hygiene rules so they always load
+  ([#1174](https://github.com/tinaudio/synth-setter/pull/1174),
+  [`2710e31`](https://github.com/tinaudio/synth-setter/commit/2710e31fa0b6d9136cfe4dbcee3237a0a0b60b87))
+
+* docs(claude-md): inline positive comment-hygiene rules so they always load
+
+Adds a short "Comment hygiene (do this when writing inline text)" section to CLAUDE.md with the
+  load-bearing actions from the comment-hygiene skill, framed as positive directives (earn each
+  comment; stay at one line; make every line carry new information; describe current behavior only;
+  open docstrings with the contract; etc.).
+
+Defers the full checklist to the comment-hygiene skill — these are the rules Claude needs in working
+  memory while writing, not just at review time.
+
+Refs #1074
+
+* Apply suggestions from code review
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+- **claude-md**: Reintroduce post-push PR-readiness loop directive
+  ([#1173](https://github.com/tinaudio/synth-setter/pull/1173),
+  [`ce63216`](https://github.com/tinaudio/synth-setter/commit/ce6321614297b8b73f1ec8e713fac221bbf71d10))
+
+* docs(claude-md): reintroduce post-push PR-readiness loop directive
+
+The AGENTS.md trim in #1158 moved the detailed post-push readiness-loop procedure (CI watch -> fix
+  -> push -> /pr-review-resolver -> wait for Copilot -> re-request -> repeat) into skill
+  descriptions. In practice, those descriptions only fire when an agent is already thinking about
+  preflight / resolving reviews, not as a self-driving loop after a push. Agents started stopping
+  after the first push and marking PRs "ready" without watching CI or re-checking Copilot.
+
+Fix the regression at the AGENTS.md level while keeping token cost flat:
+
+- New `docs/pr-readiness-loop.md` (~100 lines) carries the full procedure: the four gates, the
+  7-step loop, the two endpoints to check for Copilot output, the manual re-request fallback, and
+  three common traps (502s, UNKNOWN mergeable, no-findings reviews).
+
+- One new bullet under `## PRs` in AGENTS.md names the loop discipline, the dual-endpoint Copilot
+  check, and the re-request fallback, then links the doc. ~10 lines added; the existing
+  `/pr-preflight` / `/pr-review-resolver` / `/pr-checkbox` skill pointers stay in place.
+
+Out of scope: editing the skill descriptions themselves (they live in the tinaudio-skills plugin
+  repo, not here) and a doc-map.yaml entry (procedural docs without source-file backings don't fit
+  the doc-drift mapping pattern, same call the trim PR made for
+  src/synth_setter/pipeline/CLAUDE.md).
+
+Closes #1172 Refs #1158
+
+* fix(docs): drop broken mkdocs cross-tree link to AGENTS.md
+
+mkdocs --strict aborted on the new doc because [`AGENTS.md`](../AGENTS.md#prs) referenced a file
+  outside the docs/ tree and mkdocs only validates links among its own documentation files.
+
+AGENTS.md lives at repo root by design (it's the agent-instruction entry point, not a mkdocs site
+  page). Refer to it in plain text instead — the back-reference is informational and the first
+  sentence of the doc already states the same context.
+
+Refs #1172
+
+* Potential fix for pull request finding
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+* docs(pr-loop): include created_at/commit_id in Copilot jq projections
+
+Copilot review on PR #1173 flagged that the inline-comments and reviews jq projections didn't expose
+  enough metadata to tell new comments from already-addressed ones — `created_at` and `commit_id`
+  are needed to filter to findings posted after the last push.
+
+Add `created_at` + `commit_id` to the inline-comments projection, `commit_id` to the reviews
+  projection (which already had `submitted_at`), and a sentence explaining how to use those fields
+  against the just-pushed SHA / push timestamp.
+
+---------
+
+- **pipeline**: Clarify skypilot_launch CLI is for ad-hoc commands
+  ([#1163](https://github.com/tinaudio/synth-setter/pull/1163),
+  [`b1e8106`](https://github.com/tinaudio/synth-setter/commit/b1e810661e9abbba99bed545c10b5e179db74f73))
+
+Follow-up to PR #1157. Addresses Copilot review comments and adds a defensive guardrail that rejects
+  dispatch-owning entrypoints as the launcher's inner command.
+
+Docs: - docs/reference/configuration-reference.md §2.4 rewritten to split standard
+  (entrypoint-owned) vs ad-hoc (launcher CLI) dispatch paths, with a worked diagram for each and the
+  misuse pattern called out. - docs/design/skypilot-compute-integration.md "Local dev story"
+  switched to the standard `synth-setter-generate-dataset … skypilot_launch.compute_template=…`
+  form, with an ad-hoc launcher example following. - docs/doc-map.yaml entry for skypilot_launch.py
+  updated to reflect the dual role: ad-hoc CLI plus the shared `dispatch_via_skypilot` library the
+  standard path also calls.
+
+Code: - src/synth_setter/pipeline/skypilot_launch.py: module + main() docstrings rewritten to
+  document the ad-hoc passthrough contract; inline comment block above `cmd=shlex.join(command)`
+  rewritten. Adds `_reject_dispatch_owning_inner_command()` which raises ClickException if the inner
+  command is a `synth-setter-*` entrypoint that owns its own dispatch.
+
+Tests: - tests/pipeline/test_entrypoints/test_skypilot_launch.py exercises the guardrail across the
+  listed dispatch-owning entrypoints.
+
+Closes #1165 Refs #1157
+
+### Features
+
+- **pipeline**: Reshard h5 datas with shard size from DatasetSpec
+  ([#1178](https://github.com/tinaudio/synth-setter/pull/1178),
+  [`5647511`](https://github.com/tinaudio/synth-setter/commit/56475111467f174cfc7485443113ef07d53f4fa5))
+
+* feat(pipeline)!: reshard reads splits from DatasetSpec, drop --*-samples flags
+
+``spec.render.samples_per_shard`` and ``spec.train_val_test_sizes`` are the single source of truth
+  for shard count and split sizes; reshard now loads the DatasetSpec JSON (local path or ``r2://``
+  URI) via ``load_spec_from_uri`` and slices ``spec.shards`` in order instead of globbing
+  ``dataset_root``. The legacy ``--train-samples`` / ``--val-samples`` / ``--test-samples`` flags
+  are removed; ``--shard-size`` is rejected as a regression guard so the flag cannot be re-added
+  without a matching test update.
+
+Revives the spec-driven design from #1093, which merged onto the stranded
+  ``feat/reshard-shard-size`` branch but never reached main (#1092 and #1096 were closed without
+  merging).
+
+Closes #1091
+
+* fix(test): rename TestReshar* to TestReshard* across seven test classes
+
+Pure rename, no behavior change; flagged by multiple reviewers as the cheapest boy-scout cleanup on
+  the revival diff.
+
+Refs #1091
+
+* fix(reshard): reject WDS specs early and surface load errors as ClickException
+
+Addresses Copilot review on PR #1178:
+
+- Reject specs with output_format != 'hdf5' before any shard open; the HDF5 VirtualSource wiring
+  would otherwise crash mid-loop with a confusing FileNotFoundError on a .tar shard. - Wrap
+  load_spec_from_uri in try/except for FileNotFoundError and ValueError (which covers unsupported
+  schemes and Pydantic ValidationError); re-raise as ClickException so users see a clean message
+  instead of a raw traceback. - Update test_missing_spec_fails_loud to assert the cleaned-up surface
+  and add TestReshardOutputFormatGuard for the WDS rejection path. - Fix stale 'spec-vs-flag
+  agreement' wording in the test helper docstring.
+
+
 ## v6.2.0 (2026-05-19)
 
 ### Features
