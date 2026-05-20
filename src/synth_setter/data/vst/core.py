@@ -1,8 +1,10 @@
+import contextlib
 import json
 import plistlib
+import sys
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional, Tuple
 
 import mido
 import numpy as np
@@ -12,6 +14,10 @@ from pedalboard.io import AudioFile
 
 # How long the editor stays open before we signal it to close.
 _EDITOR_INIT_DELAY_SECONDS = 0.5
+# Upper bound on how long ``editor_held_open`` waits for the editor thread to
+# drain after the close event is set; a generous safety net for the held-open
+# path (#1187), not a normal-case timing parameter.
+_EDITOR_JOIN_TIMEOUT_SECONDS = 2.0
 
 
 def extract_renderer_version(plugin_path: Path) -> str:
@@ -85,6 +91,63 @@ def warmup_plugin(plugin: VST3Plugin) -> None:
         close_editor.set()  # defensive: ensure show_editor unblocks even if Timer fails
 
 
+@contextlib.contextmanager
+def editor_held_open(plugin: VST3Plugin) -> Iterator[None]:
+    """Hold ``plugin.show_editor`` open on a background thread for the ``with`` body.
+
+    The editor runs on a daemon thread blocking inside ``show_editor(close_event)``.
+    ``__exit__`` sets the event, joins the thread (bounded by
+    ``_EDITOR_JOIN_TIMEOUT_SECONDS``), and re-raises any exception the editor
+    thread raised — already logged at the moment of failure via
+    ``logger.exception``. **Body exceptions always win:** if the ``with`` body
+    raises, that exception propagates and a captured editor-thread exception
+    is logged but not re-raised (it would otherwise mask the original error in
+    the ``finally``-clause raise). If the join times out the daemon thread is
+    left to be reaped at process exit; a warning records the leak.
+
+    :param plugin: A loaded VST3 plugin whose editor is realised for the block.
+    :raises Exception: Propagated from the editor thread at ``__exit__`` only
+        when the ``with`` body itself raised nothing — typically a
+        ``RuntimeError`` from the VST3 host.
+    """
+    close_editor = threading.Event()
+    captured: list[Exception] = []
+
+    def _run_editor() -> None:
+        try:
+            plugin.show_editor(close_editor)
+        except Exception as exc:  # noqa: BLE001 — fan-in for any host-side failure
+            logger.exception("vst-editor-window crashed: {}", exc)
+            captured.append(exc)
+
+    editor_thread = threading.Thread(target=_run_editor, daemon=True, name="vst-editor-window")
+    editor_thread.start()
+    try:
+        yield
+    finally:
+        close_editor.set()
+        editor_thread.join(timeout=_EDITOR_JOIN_TIMEOUT_SECONDS)
+        if editor_thread.is_alive():
+            logger.warning(
+                "vst-editor-window did not drain within {}s; daemon thread "
+                "leaks (reaped at process exit)",
+                _EDITOR_JOIN_TIMEOUT_SECONDS,
+            )
+        # sys.exc_info() returns the body's exception if `with` body raised,
+        # else (None, None, None). Only surface the captured editor-thread
+        # exception when the body succeeded — re-raising during an active
+        # body exception would mask the original error (raise-in-finally wins).
+        body_exc_active = sys.exc_info()[0] is not None
+        if captured and not body_exc_active:
+            exc: Exception = captured[0]
+            raise exc
+        if captured and body_exc_active:
+            logger.error(
+                "vst-editor-window also crashed during body exception: {}",
+                captured[0],
+            )
+
+
 def load_preset(plugin: VST3Plugin, preset_path: str) -> None:
     logger.info(f"Loading preset {preset_path}")
     plugin.load_preset(preset_path)
@@ -106,13 +169,13 @@ def render_params(
     params: dict[str, float],
     midi_note: int,
     velocity: int,
-    note_start_and_end: Tuple[float, float],
+    note_start_and_end: tuple[float, float],
     signal_duration_seconds: float,
     sample_rate: float,
     channels: int,
-    preset_path: Optional[str] = None,
+    preset_path: str | None = None,
     *,
-    plugin: Optional[VST3Plugin] = None,
+    plugin: VST3Plugin | None = None,
     warmup: bool = False,
 ) -> np.ndarray:
     """Render a single audio sample; reuse ``plugin`` if supplied, else load fresh.
