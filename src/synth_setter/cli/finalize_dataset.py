@@ -2,9 +2,11 @@
 
 Mirrors ``generate-dataset``'s operator-side shape — programmatic Hydra
 compose, single ``DatasetSpec`` input, dispatch on ``spec.output_format``.
-The wds branch streams the train shards through Welford row-by-row,
-uploads ``stats.npz``, then writes the ``dataset.complete`` marker last
-per ``pipeline/CLAUDE.md``. hdf5 is not implemented (#1183).
+Both branches upload their derived artifact(s) and then write the
+``dataset.complete`` marker last per ``pipeline/CLAUDE.md``. The wds
+branch streams train shards through Welford row-by-row; the hdf5 branch
+downloads every shard, reshards into ``{train,val,test}.h5``, and
+computes ``stats.npz`` over the train split.
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NoReturn
 
 import rootutils
 from hydra import compose, initialize_config_dir
@@ -28,10 +29,13 @@ from synth_setter.cli.generate_dataset import spec_from_cfg  # noqa: E402
 from synth_setter.pipeline import r2_io  # noqa: E402
 from synth_setter.pipeline.constants import (  # noqa: E402
     DATASET_COMPLETE_FILENAME,
+    INPUT_SPEC_FILENAME,
     STATS_NPZ_FILENAME,
 )
-from synth_setter.pipeline.data.stats import stream_stats_wds  # noqa: E402
+from synth_setter.pipeline.data.reshard import reshard_dataset  # noqa: E402
+from synth_setter.pipeline.data.stats import get_stats_hdf5, stream_stats_wds  # noqa: E402
 from synth_setter.pipeline.schemas.spec import DatasetSpec  # noqa: E402
+from synth_setter.pipeline.spec_io import write_spec_to_path  # noqa: E402
 
 # Resolve repo root from this file so the entrypoint is cwd-independent.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -91,15 +95,65 @@ def finalize_wds(spec: DatasetSpec, work_dir: Path) -> None:
     logger.info("uploaded stats to {}", spec.r2.stats_uri())
 
 
-def finalize_hdf5(spec: DatasetSpec, work_dir: Path) -> NoReturn:
-    """Reject hdf5 finalize until the writer side is implemented — see #1183.
+def finalize_hdf5(spec: DatasetSpec, work_dir: Path) -> None:
+    """Download every shard, reshard into split files, compute stats, upload all artifacts.
 
-    :param spec: Validated dataset spec; unused.
-    :param work_dir: Scratch directory; unused.
-    :raises NotImplementedError: Always — hdf5 finalize is not implemented yet.
+    Writes ``work_dir/input_spec.json`` flat (via
+    :func:`~synth_setter.pipeline.spec_io.write_spec_to_path`) so
+    :func:`~synth_setter.pipeline.data.reshard.reshard_dataset`'s default
+    spec discovery picks it up without a ``--spec`` override. The flat
+    placement diverges from :func:`~synth_setter.pipeline.spec_io.write_spec_locally`'s
+    nested ``<output_dir>/data/<task>/<run>/metadata/`` layout because
+    ``work_dir`` is a per-finalize scratch tempdir whose only consumer is
+    reshard — re-creating the operator-side ``data/`` hierarchy under it
+    would force the reshard adapter to learn that layout for no benefit.
+    ``get_stats_hdf5`` then writes ``work_dir / "stats.npz"`` (path derived
+    via ``SurgeXTDataset.get_stats_file_path(train.h5)``); the post-call
+    existence guard pins that contract so a future drift in the derivation
+    surfaces here rather than as a missing upload source. Structural
+    validation (per ``pipeline/CLAUDE.md``) is delegated to the h5py opens
+    that ``reshard_dataset`` performs while staging each split — finalize
+    never re-runs the workers' full four-check pass.
+
+    :param spec: Validated dataset spec (``output_format == "hdf5"``).
+    :param work_dir: Scratch directory; shards, splits, stats and the spec
+        copy live here transiently for the duration of the call.
+    :raises ValueError: The train split is empty
+        (``spec.split_shard_ranges["train"]`` has ``lo >= hi``); reshard
+        would prune ``train.h5`` and stats compute would fail with a
+        low-signal HDF5 error.
+    :raises FileNotFoundError: ``get_stats_hdf5`` returned without writing
+        ``work_dir / "stats.npz"``, breaking the upload-source contract.
     """
-    del spec, work_dir
-    raise NotImplementedError("hdf5 finalize is not implemented yet")
+    train_lo, train_hi = spec.split_shard_ranges["train"]
+    if train_lo >= train_hi:
+        raise ValueError(
+            f"train split is empty (split_shard_ranges['train']="
+            f"{spec.split_shard_ranges['train']!r}); cannot compute stats "
+            f"without at least one train shard."
+        )
+    for shard in spec.shards:
+        r2_io.download_to_path(spec.r2.shard_uri(shard), work_dir / shard.filename)
+    write_spec_to_path(spec, work_dir / INPUT_SPEC_FILENAME)
+    reshard_dataset(work_dir)
+    get_stats_hdf5(str(work_dir / "train.h5"))
+    stats_npz = work_dir / STATS_NPZ_FILENAME
+    if not stats_npz.is_file():
+        raise FileNotFoundError(
+            f"get_stats_hdf5 did not write {stats_npz}; check "
+            f"SurgeXTDataset.get_stats_file_path derivation."
+        )
+    # Reshard prunes empty splits — only upload the ones it actually wrote.
+    # Iterate ``split_shard_ranges`` (Split-typed keys) so split_h5_uri's
+    # Literal narrowing holds without a cast.
+    for split in spec.split_shard_ranges:
+        split_h5 = work_dir / f"{split}.h5"
+        if split_h5.exists():
+            split_uri = spec.r2.split_h5_uri(split)
+            r2_io.upload(split_h5, split_uri)
+            logger.info("uploaded {} to {}", split_h5.name, split_uri)
+    r2_io.upload(stats_npz, spec.r2.stats_uri())
+    logger.info("uploaded stats to {}", spec.r2.stats_uri())
 
 
 def main() -> None:
