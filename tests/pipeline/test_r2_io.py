@@ -179,6 +179,157 @@ class TestUploadToUri:
         assert "--retries=3" in args
 
 
+class TestIsR2Reachable:
+    """Tests for ``is_r2_reachable`` — boolean auth-probe used as a test-skip gate."""
+
+    def test_returns_true_when_rclone_lsd_exits_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Happy path: rclone on PATH, env keys present, probe exits 0.
+
+        :param monkeypatch: Pytest fixture used to stub PATH + env + ``subprocess.run``.
+        """
+        monkeypatch.setattr(
+            "synth_setter.pipeline.r2_io.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        for key in r2_io._SECRET_R2_ENV_KEYS:  # noqa: SLF001 — test asserts contract
+            monkeypatch.setenv(key, "stub")
+
+        class _OK:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr("synth_setter.pipeline.r2_io.subprocess.run", lambda *a, **kw: _OK())
+        assert r2_io.is_r2_reachable() is True
+
+    def test_returns_false_when_rclone_lsd_exits_non_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Auth failure: rclone + env keys present but the probe exits non-zero.
+
+        :param monkeypatch: Pytest fixture used to stub PATH + env + ``subprocess.run``.
+        """
+        monkeypatch.setattr(
+            "synth_setter.pipeline.r2_io.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        for key in r2_io._SECRET_R2_ENV_KEYS:  # noqa: SLF001 — test asserts contract
+            monkeypatch.setenv(key, "stub")
+
+        def fake_run(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise subprocess.CalledProcessError(returncode=1, cmd=["rclone", "lsd", "r2:"])
+
+        monkeypatch.setattr("synth_setter.pipeline.r2_io.subprocess.run", fake_run)
+        assert r2_io.is_r2_reachable() is False
+
+    def test_returns_false_when_rclone_not_on_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Bare clone / missing binary: rclone is absent from PATH.
+
+        :param monkeypatch: Pytest fixture used to stub ``shutil.which``.
+        """
+        monkeypatch.setattr("synth_setter.pipeline.r2_io.shutil.which", lambda _name: None)
+        # subprocess.run must never be called — short-circuit on PATH miss.
+        monkeypatch.setattr(
+            "synth_setter.pipeline.r2_io.subprocess.run",
+            lambda *a, **kw: pytest.fail("subprocess.run should not be reached"),
+        )
+        assert r2_io.is_r2_reachable() is False
+
+    def test_returns_false_when_secret_env_keys_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rclone-on-PATH + working local config but no env keys → skip, not hard-fail later.
+
+        Mirrors the contract of ``ensure_r2_env_loaded`` so a test that
+        gates on ``is_r2_reachable`` doesn't pass the gate and then crash
+        on ``RuntimeError`` from the env-key check downstream.
+
+        :param monkeypatch: Pytest fixture used to clear env + stub the probe.
+        """
+        monkeypatch.setattr(
+            "synth_setter.pipeline.r2_io.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        for key in r2_io._SECRET_R2_ENV_KEYS:  # noqa: SLF001 — test asserts contract
+            monkeypatch.delenv(key, raising=False)
+        # subprocess.run must never be called — short-circuit on missing env.
+        monkeypatch.setattr(
+            "synth_setter.pipeline.r2_io.subprocess.run",
+            lambda *a, **kw: pytest.fail("subprocess.run should not be reached"),
+        )
+        assert r2_io.is_r2_reachable() is False
+
+
+class TestUpload:
+    """Tests for ``upload`` — source-type-tolerant wrapper over ``rclone copyto``."""
+
+    def test_local_path_source_lands_at_destination(
+        self, fake_r2_remote: Path, tmp_path: Path
+    ) -> None:
+        """A local ``Path`` source uploads via the same path ``upload_to_uri`` exercises.
+
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        :param tmp_path: Pytest tmp dir used for the upload source file.
+        """
+        src = tmp_path / "in.json"
+        src.write_text('{"payload": 7}')
+
+        r2_io.upload(src, "r2://bucket/key.json")
+
+        assert (fake_r2_remote / "bucket" / "key.json").read_text() == '{"payload": 7}'
+
+    def test_local_str_path_source_lands_at_destination(
+        self, fake_r2_remote: Path, tmp_path: Path
+    ) -> None:
+        """A local path passed as ``str`` is coerced to ``Path`` and uploaded.
+
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        :param tmp_path: Pytest tmp dir used for the upload source file.
+        """
+        src = tmp_path / "in.json"
+        src.write_text("{}")
+
+        r2_io.upload(str(src), "r2://bucket/key.json")
+
+        assert (fake_r2_remote / "bucket" / "key.json").is_file()
+
+    def test_r2_uri_source_copies_remote_to_remote(
+        self, fake_r2_remote: Path, tmp_path: Path
+    ) -> None:
+        """An ``r2://`` source triggers an rclone R2→R2 copy (not a local upload).
+
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        :param tmp_path: Pytest tmp dir (unused but threaded for fixture symmetry).
+        """
+        seed = fake_r2_remote / "bucket" / "src" / "key.json"
+        seed.parent.mkdir(parents=True)
+        seed.write_text('{"seed": true}')
+
+        r2_io.upload("r2://bucket/src/key.json", "r2://bucket/dst/key.json")
+
+        assert (fake_r2_remote / "bucket" / "dst" / "key.json").read_text() == '{"seed": true}'
+
+    def test_r2_uri_source_uses_rclone_copyto_with_reliability_flags(self, tmp_path: Path) -> None:
+        """R2→R2 path carries the same reliability flag set as the local-upload path.
+
+        :param tmp_path: Pytest tmp dir (unused; threaded so fixture isolation is consistent).
+        """
+        with patch.object(r2_io.subprocess, "check_call") as mock_call:
+            r2_io.upload("r2://bucket/src/key.json", "r2://bucket/dst/key.json")
+        args = mock_call.call_args[0][0]
+        assert args[:2] == ["rclone", "copyto"]
+        assert "--checksum" in args
+        assert "--contimeout=30s" in args
+        assert "--timeout=300s" in args
+        assert "--retries=3" in args
+        assert args[-2:] == ["r2:bucket/src/key.json", "r2:bucket/dst/key.json"]
+
+    def test_rejects_path_whose_text_looks_like_r2_uri(self) -> None:
+        """A ``Path("r2://...")`` is rejected so dispatch is unambiguous between local and R2."""
+        with pytest.raises(TypeError, match=r"upload\(\) received Path.*r2://"):
+            r2_io.upload(Path("r2://bucket/src/key.json"), "r2://bucket/dst/key.json")
+
+
 class TestDownloadedToTempfile:
     """Tests for the downloaded_to_tempfile context manager."""
 

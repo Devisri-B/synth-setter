@@ -10,6 +10,7 @@ when any of these functions runs; ``ensure_r2_env_loaded`` is the load + validat
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator
@@ -25,10 +26,12 @@ __all__ = [
     "download_to_path",
     "downloaded_to_tempfile",
     "ensure_r2_env_loaded",
+    "is_r2_reachable",
     "is_r2_uri",
     "object_size",
     "shard_uri",
     "to_rclone_path",
+    "upload",
     "upload_to_uri",
 ]
 
@@ -113,6 +116,36 @@ def ensure_r2_env_loaded(env_file: Path | None = None) -> None:
         )
 
 
+def is_r2_reachable() -> bool:
+    """Return ``True`` iff every :func:`ensure_r2_env_loaded` precondition holds.
+
+    Tests gate ``@pytest.mark.integration_r2`` cases on this helper. The
+    predicate has to match :func:`ensure_r2_env_loaded`'s contract — if it
+    returns ``True`` only because a user's local rclone config makes
+    ``rclone lsd r2:`` succeed while the secret env keys are unset, the
+    test then calls :func:`ensure_r2_env_loaded` and hits a hard
+    ``RuntimeError`` instead of the intended auto-skip.
+
+    :returns: ``True`` when rclone is on PATH AND all three
+        ``_SECRET_R2_ENV_KEYS`` are present in ``os.environ`` AND a
+        credentialled ``rclone lsd r2:`` exits 0; ``False`` otherwise.
+    """
+    if shutil.which("rclone") is None:
+        return False
+    if not all(key in os.environ for key in _SECRET_R2_ENV_KEYS):
+        return False
+    try:
+        subprocess.run(  # noqa: S603 — args are literal strings
+            ["rclone", "lsd", "r2:", "--contimeout=10s", "--timeout=30s"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    return True
+
+
 def is_r2_uri(uri: str) -> bool:
     """Return True if `uri` is an `r2://bucket/key` URI."""
     return uri.startswith(R2_URI_SCHEME)
@@ -173,6 +206,44 @@ def upload_to_uri(local_path: Path, r2_uri: str) -> None:
         _to_rclone_path(r2_uri),
     ]
     subprocess.check_call(args)  # noqa: S603 — args from validated URI
+
+
+def upload(source: str | Path, destination_uri: str) -> None:
+    """Copy ``source`` to ``destination_uri``; ``source`` is a local path or ``r2://`` URI.
+
+    R2-source dispatches to ``rclone copyto`` (R2→R2 promotion); local-source
+    delegates to :func:`upload_to_uri` so the reliability-flag set lives in
+    one place.
+
+    :param source: Local filesystem path (``str`` or ``Path``) or ``r2://`` URI
+        as a ``str`` — a ``Path`` whose text starts with ``r2://`` is rejected
+        because the type signature carries no URI semantics.
+    :param destination_uri: Destination ``r2://`` URI.
+    :raises TypeError: ``source`` is a ``Path`` whose textual form begins with
+        ``r2://``; pass the URI as ``str`` so dispatch is unambiguous.
+    """
+    if isinstance(source, Path) and str(source).startswith(("r2://", "r2:/")):
+        # ``Path("r2://bucket/key")`` collapses the double slash to ``"r2:/bucket/key"``,
+        # so both forms have to be guarded; either way the caller meant a URI.
+        raise TypeError(
+            f"upload() received Path({str(source)!r}); pass r2:// URIs as str "
+            f"so the source-type dispatch is unambiguous."
+        )
+    if isinstance(source, str) and is_r2_uri(source):
+        args = [  # noqa: S607 — rclone resolved by image's PATH
+            "rclone",
+            "copyto",
+            "-vv",
+            "--checksum",
+            "--contimeout=30s",
+            "--timeout=300s",
+            "--retries=3",
+            _to_rclone_path(source),
+            _to_rclone_path(destination_uri),
+        ]
+        subprocess.check_call(args)  # noqa: S603 — args from validated URIs
+        return
+    upload_to_uri(Path(source), destination_uri)
 
 
 def shard_uri(bucket: str, prefix: str, shard_filename: str) -> str:
