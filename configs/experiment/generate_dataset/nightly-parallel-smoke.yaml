@@ -1,0 +1,22 @@
+# @package _global_
+
+# Nightly smoke for RenderConfig.parallel=true: 32 samples → 4 shards at
+# samples_per_shard=8, sized so Xvfb bootstraps ≥2 wrappers concurrently.
+# max_retries stays at 0 (default fail-fast) — the nightly's purpose is to
+# catch parallel-dispatch regressions, which a retry budget would mask.
+
+defaults:
+  - override /data: surge_simple
+  - override /render: surge_simple
+  - _self_
+
+task_name: nightly-parallel-smoke
+
+train_val_test_sizes: [32, 0, 0]
+
+render:
+  sample_rate: 16000
+  min_loudness: -50.0
+  samples_per_render_batch: 8
+  samples_per_shard: 8
+  parallel: true

@@ -62,6 +62,8 @@ docs:
         covers: "Reusable launcher fan-out across providers (skypilot-local kind, runpod, oci); per-provider artifact upload; emits a `spec_uri` workflow output (the materialized spec's canonical under-prefix `input_spec.json` URI, computed by the `synth-setter-spec-uri` console script — see `src/synth_setter/pipeline/ci/spec_uri.py`) consumed by validate-dataset-shards"
       - pattern: ".github/workflows/validate-dataset-shards.yaml"
         covers: "Reusable spec + shard validation downstream of generate-dataset-shards; takes the `spec_uri` (r2://) emitted by generate-dataset-shards as its `spec_uri` input"
+      - pattern: ".github/workflows/nightly-parallel-datagen.yml"
+        covers: "Nightly + workflow_dispatch running generate-dataset with `++render.parallel=true` against real Surge XT + real R2, then validating spec + shards via `pipeline.ci.{validate_spec,validate_shard}`. Per-run unique `task_name` scopes the ephemeral R2 prefix to `data/<task_name>/<run_id>/` (preserves the `data/` invariant); always-on rclone purge on cleanup. Fills the CI gap left by the slow + requires_vst Linux Xvfb integration test."
       - pattern: "src/synth_setter/pipeline/ci/**"
         covers: "CI validation scripts, spec materialization, shard validation, and spec-URI extraction (`spec_uri.py` / `synth-setter-spec-uri`)"
       - pattern: "src/synth_setter/pipeline/r2_io.py"
