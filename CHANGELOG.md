@@ -1,6 +1,470 @@
 # CHANGELOG
 
 
+## v8.5.1 (2026-05-20)
+
+### Bug Fixes
+
+- **vst**: Put gui on main thread for gui_toggle_cadence=always_on
+  ([`cc0df18`](https://github.com/tinaudio/synth-setter/commit/cc0df1838ed6412daae3e8f2d86b3d61a5ccb740))
+
+* fix(data-pipeline): add editor-thread start handshake to editor_held_open
+
+Block ``editor_held_open`` on a bounded ``editor_started`` event before yielding so the shard render
+  cannot begin before the editor thread has been scheduled past the entry point. A slow-start miss
+  logs a warning and proceeds — the handshake only proves scheduling, not window realisation
+  (pedalboard exposes no editor-ready signal).
+
+Closes #1198
+
+* test(data-pipeline): tighten editor-thread handshake test to assert start-before-yield invariant
+
+Replaces the post-yield ``inside_show_editor.is_set()`` check (flaky: ``editor_started`` fires one
+  line before ``show_editor`` is called, so a deschedule between them voids the assertion) with a
+  gated timestamp comparison that proves the ``with`` body waits for the start handshake.
+
+Refs #1204
+
+* chore(data-pipeline): address repo-review WARNs on editor_held_open (#1204)
+
+Resolves five inline WARNs from the /repo-review-full pass; two deferred to follow-up issues #1207
+  and #1208.
+
+- core.py:23 (comment-hygiene) — collapse 3-line module comment for _EDITOR_START_TIMEOUT_SECONDS to
+  a single-line pointer. - core.py:128 (code-health) — move editor_started.set() inside the try
+  block so the handshake also proves the host has not raised before we reach show_editor; docstring
+  tightened to match. - test_core.py:258 (comment-hygiene) — tighten the 4-line slow-start inline
+  comment to two lines. - test_core.py:208 (tdd-impl) — add inverse-race pinning test
+  test_without_handshake_body_enters_before_editor_thread_starts that zeroes the timeout and asserts
+  the body enters while the editor thread is still gated; proves the positive test passes because of
+  the handshake, not scheduler luck. - test_core.py:197 (tdd-impl) — addressed by 25824ee; the
+  time.sleep inside deferred() is gone and _EDITOR_START_TIMEOUT_SECONDS is already pinned
+  explicitly in the slow-start test.
+
+Deferred: - core.py:24 (ml-pipeline) — surfacing slow-start to shard metadata is larger than this
+  PR; tracked in #1207. - test_core.py:191 (code-health) — consolidating the threading.Thread test
+  wrappers is optional cleanup; tracked in #1208.
+
+* fix(data-pipeline): editor_held_open raises on slow-start + add render-config CI matrix (#1204)
+
+* Reverse editor_held_open slow-start contract: a missed start handshake now raises
+  EditorStartTimeout instead of warning-and-proceeding. The body never runs on miss, so a stuck
+  editor bring-up surfaces loud and traceable rather than degrading to a log line lost in noise.
+  Tests updated: positive-path retained; slow-start now asserts the raise + unrun body; inverse-race
+  switches to a per-instance wait stub since zeroing _EDITOR_START_TIMEOUT_SECONDS would also raise.
+  * Add .github/workflows/test-dataset-generation-render-matrix.yml — PR matrix dispatching
+  generate-dataset-shards.yaml across smoke-shard {hdf5,wds} + ci-materialize-test {hdf5,wds} +
+  nightly-parallel-smoke (5 cells, skypilot-local). fail-fast disabled so one broken config does not
+  mask siblings; path-filter scoped to data/vst, render-config, and the schemas / CLI surface that
+  drives them.
+
+* ci(render-matrix): drop ci-materialize-test cells — out of scope for this matrix
+
+The render-config matrix on #1204 exists to catch regressions in the editor_held_open handshake, the
+  always_on gui-toggle cadence, and RenderConfig.parallel — i.e. render-side code paths.
+  ci-materialize-test exists for spec-materialization round-trip, not for render-code coverage: the
+  wds writer is already exercised by smoke-shard-wds, and the 96-sample hdf5 cadence adds no
+  render-side signal the smoke configs don't already cover (the smoke configs already render samples
+  through the same plugin scope).
+
+Drop both ci-materialize-test rows. The matrix is now 3 cells: smoke-shard/hdf5,
+  smoke-shard-wds/wds, nightly-parallel-smoke/hdf5 — all of which fit comfortably inside the
+  existing 20-min cell budget on generate-dataset-shards.yaml, so the timeout bump from the previous
+  revision is reverted.
+
+* ci(render-matrix): smoke-shard × gui_toggle_cadence × output_format (8-cell parallel fan-out)
+
+Reshape the render-config matrix to the form #1204 asked for: one base config (smoke-shard, the only
+  PR-time experiment that fits the reusable's 20-min step cap) fanned across every
+  gui_toggle_cadence Literal value ({never, once, render, always_on}) and both output_format values
+  ({hdf5, wds}). Eight cells in parallel, fail-fast: false — so the always_on cell that guards the
+  editor_held_open handshake (#1198, #1204) emits its own pass/fail signal per PR instead of riding
+  the next nightly cron.
+
+Adds an optional `hydra_overrides` string input to the `generate-dataset-shards.yaml` reusable so
+  the cadence × format axes can be injected per cell without pre-baking eight Hydra experiment
+  files. Tokens are split on whitespace and appended to the launcher's `OVERRIDES` array
+  (skypilot-local row) or expanded unquoted inside the worker container (runpod/oci row). Default
+  empty — existing callers (`test-dataset-generation.yml`) are unchanged.
+
+`nightly-parallel-smoke` coverage of `RenderConfig.parallel` (#1189) stays on the weekly cron;
+  multiplying that config by 8 cells would not fit under the 20-min step cap.
+
+* test(data-pipeline): pin EditorStartTimeout propagation through _render_in_batches (#1204)
+
+Regression test asserting that EditorStartTimeout raised by editor_held_open escapes
+  _render_in_batches unswallowed. The slow-start contract reversal in 3c8ed75 only delivers its
+  signal if upstream callers do not wrap the held-open scope in a try/except RuntimeError fallback —
+  this test pins that contract.
+
+Stubs editor_held_open with a context manager that raises EditorStartTimeout on __enter__ and
+  asserts (1) the exception reaches the caller verbatim and (2) no generate_sample calls fire on the
+  rejected scope.
+
+Refs https://github.com/tinaudio/synth-setter/pull/1204#issuecomment-4500697502
+
+* fix(data-pipeline): join editor thread on EditorStartTimeout + tighten hydra_overrides escaping
+  contract (#1204)
+
+Three Copilot findings from the post-matrix-restructure re-review on PR #1204.
+
+Finding 1 — `editor_held_open` editor-thread leak on timeout The start-handshake-miss path raised
+  `EditorStartTimeout` before entering the `try/finally`, so the editor daemon was never joined. A
+  late-starting thread could still call `show_editor` (or hang) past the failed context- entry,
+  leaking work. Moved the `editor_started.wait(...)` check inside the `try` so the existing
+  `finally` clause (`close_editor.set()` + bounded `editor_thread.join()` + leak warning) runs on
+  both the timeout-miss path and the success/body-raise path. Added
+  `test_slow_start_joins_editor_thread_before_raising` to pin the contract via
+  `editor_thread.is_alive()` post-raise, and updated the existing slow-start test so the editor
+  thread is actually started (real thread with a deferred `editor_started.set()`) instead of relying
+  on the old never-joined codepath.
+
+Finding 2 — `hydra_overrides` unquoted expansion in the docker path The skypilot-local path
+  tokenises `$INPUT_HYDRA_OVERRIDES` via `read -ra ... <<<` and forwards the array safely. The
+  runpod/oci docker path expands `$HYDRA_OVERRIDES_EXTRA` unquoted inside the container, so
+  backslash-escaped spaces inside a single token would not survive. Hydra overrides are always
+  `key=value` with no spaces in practice, so the docstring was overstating the contract. Tightened
+  both `workflow_call.inputs.hydra_overrides.description` and
+  `workflow_dispatch.inputs.hydra_overrides.description` to require `key=value` tokens with no
+  embedded spaces, and added a matching note in the top-of-file workflow comment.
+
+Finding 3 — PR description drift PR body claimed slow-start "logs a warning and proceeds"; actual
+  behaviour raises `EditorStartTimeout` and skips the `with` body. Updated the PR description to
+  match the implementation/docstring (not a code change in this commit).
+
+* fix(ci): validate hydra_overrides characters to block shell metacharacters (#1204)
+
+Copilot inline comment on `.github/workflows/generate-dataset-shards.yaml` (comment id 3276052582)
+  flagged that the runpod/oci docker row expands `$HYDRA_OVERRIDES_EXTRA` unquoted inside `bash -c`,
+  so shell metacharacters in the caller-provided `hydra_overrides` input (`;`, `&&`, `|`, `$()`,
+  ...) would be interpreted as shell syntax on the worker. The prior fix only tightened the
+  docstring — the docstring doesn't enforce anything at runtime, so a value like
+  `render.gui_toggle_cadence=always_on; rm -rf /` could still execute arbitrary code.
+
+Added a `Validate hydra_overrides` step immediately after `Checkout` (runs for both skypilot-local
+  and runpod/oci paths) that rejects any input not matching `^[A-Za-z0-9._=,/-]*(
+  [A-Za-z0-9._=,/-]+)*$` — alphanumeric tokens with `.`/`_`/`=`/`,`/`/`/`-` separated by single
+  spaces. Empty string is allowed (the default). Failure mode is a `::error::` annotation + non-zero
+  exit, surfacing as a clean workflow failure before the unquoted expansion can run.
+
+Updated the workflow header comment + both `hydra_overrides.description` fields to call out the
+  validation regex so callers know exactly what's accepted.
+
+Added `tests/infra/test_generate_dataset_shards_hydra_overrides_validation.py` with 25 cases:
+  workflow-shape assertions (step exists, uses the documented character class, binds
+  `inputs.hydra_overrides`, runs before the `gen_docker` step) plus a regex cross-check over
+  canonical safe inputs (`output_format=wds`, `path=foo/bar/baz`, ...) and shell-injection samples
+  (`;rm -rf /`, `&&curl`, `$(whoami)`, ` `` `id` `` , backslash-escapes, newlines, double-spaces).
+
+Live-verified the bash logic rejects the injection payload from the Copilot comment and accepts the
+  existing matrix inputs.
+
+* fix(configs): materialize gui_toggle_cadence default so render-matrix overrides resolve (#1204)
+
+The render-config matrix (.github/workflows/test-dataset-generation-render-matrix.yml) passes
+  `render.gui_toggle_cadence=<cadence>` as a Hydra override. The composed YAML did not list the key
+  (it lived only as a Pydantic default on RenderConfig), so Hydra's strict mode rejected the
+  override with
+
+Could not override 'render.gui_toggle_cadence'. To append to your config use
+  +render.gui_toggle_cadence=...
+
+failing all 8 matrix cells (run 26180255716). Materialize the key in configs/render/surge_xt.yaml —
+  surge_simple.yaml inherits from it — with the cross-platform-safe value `never` so non-overriding
+  callers compose on Darwin (`render` is rejected by
+  RenderConfig._gui_toggle_cadence_forbids_render_on_darwin) and matrix `key=value` overrides
+  resolve without `+`.
+
+Verified locally: all 8 cadence × output_format cells compose via
+  `hydra.compose(config_name='dataset', overrides=[...])` without ConfigCompositionException.
+
+* fix(configs): scope gui_toggle_cadence materialization to smoke-shard only (avoid global default
+  flip)
+
+- Revert the `gui_toggle_cadence: never` line in `configs/render/surge_xt.yaml` so every config that
+  inherits `surge_xt` (directly or via `surge_simple`) keeps its platform-aware default (`render` on
+  Linux, `never` on Darwin). The previous materialization silently flipped Linux defaults from
+  `render` to `never` for `smoke-shard-wds`, `ci-materialize-test`, `ci-materialize-test-wds`,
+  `surge-simple-480k-10k`, `10-1k-shards`, and `nightly-parallel-smoke`. - Materialize the key in
+  `configs/experiment/generate_dataset/smoke-shard.yaml` instead — the matrix workflow's sole base
+  config — so `render.gui_toggle_cadence=<cell>` Hydra overrides still resolve without struct-mode
+  rejection. Linux compose check confirms only `smoke-shard` reports `never`; siblings keep
+  `render`. - Fix docstring drift in
+  `tests/infra/test_generate_dataset_shards_hydra_overrides_validation.py` ("A doctable at the
+  bottom of the module" -> "The parametrized cases below"): the samples are parametrized test cases,
+  not a separate doctable section.
+
+* fix(ci): pin plugin_reload_cadence=once so always_on matrix cells compose (#1204)
+
+The render-matrix workflow's two `always_on` cells (`cadence=always_on / {hdf5,wds}`) fail at
+  `DatasetSpec` construction with:
+
+gui_toggle_cadence="always_on" requires plugin_reload_cadence="once" so the editor stays bound to a
+  single live plugin instance for the whole shard. Set plugin_reload_cadence="once" to opt in.
+
+The `_always_on_requires_plugin_reload_once` cross-field validator on `RenderConfig`
+  (`src/synth_setter/pipeline/schemas/spec.py:293`) rejects `gui_toggle_cadence="always_on"`
+  whenever `plugin_reload_cadence` is not `"once"`. The schema default for `plugin_reload_cadence`
+  is `"render"`, so the always_on matrix cells trip the validator at compose time.
+
+The constraint is one-way: `always_on` requires `once`, but `once` is compatible with every
+  `gui_toggle_cadence` value. Pinning `plugin_reload_cadence: once` in `smoke-shard.yaml` therefore
+  satisfies the validator on the two always_on cells without breaking the other six matrix cells
+  (never / once / render x hdf5 / wds).
+
+This mirrors the prior `gui_toggle_cadence` materialization (da74e64) — same file, same pattern,
+  scoped to `smoke-shard` only so sibling experiments (`smoke-shard-wds`,
+  `ci-materialize-test{,-wds}`, `surge-simple-480k-10k`, `10-1k-shards`, `nightly-parallel-smoke`)
+  keep their schema-default `plugin_reload_cadence="render"`.
+
+Verification on Linux (`PROJECT_ROOT=$(pwd)`, all 8 cells via `hydra.compose` + `spec_from_cfg`):
+
+never /hdf5: OK (gui=never reload=once) never /wds : OK (gui=never reload=once) once /hdf5: OK
+  (gui=once reload=once) once /wds : OK (gui=once reload=once) render /hdf5: OK (gui=render
+  reload=once) render /wds : OK (gui=render reload=once) always_on/hdf5: OK (gui=always_on
+  reload=once) always_on/wds : OK (gui=always_on reload=once)
+
+Siblings keep their defaults (`reload=render`) and
+  `tests/pipeline/test_configs/test_experiment_yamls.py` stays green (14 passed).
+
+Failing-run reference: https://github.com/tinaudio/synth-setter/actions/runs (PR #1204 — the two
+  `smoke-shard / cadence=always_on / {hdf5,wds}` cells on HEAD da74e64).
+
+* fix(ci): close multi-line bypass in hydra_overrides validation (Copilot review)
+
+The previous validation step piped the input through `grep -Eq`, which is line-oriented: a payload
+  like `key=value$'\n'; rm -rf /` slipped through because grep returns success when *any* line
+  matches the regex, even though the docker (runpod/oci) row's unquoted `$HYDRA_OVERRIDES_EXTRA`
+  expansion would then treat the newline as a command separator and run the trailing line as shell.
+
+Replace the pipeline with a whole-input bash check — `[[ ... =~ ]]` matches the entire string by
+  default — and an explicit `$'\n'` / `$'\r'` guard that rejects multi-line inputs with a clear
+  error before regex matching (Copilot comment 3276253964).
+
+The test file now also exercises the workflow's actual bash construct via `subprocess.run(["bash",
+  "-c", ...])`, so the multi-line rejection cases assert real CI behavior rather than a Python regex
+  stand-in. A new `test_validation_step_uses_whole_input_bash_regex` pins that the workflow uses `[[
+  ... =~ ]]` and forbids the line-oriented `grep -Eq` form, so any future regression to a
+  line-oriented matcher fails the suite (Copilot comment 3276254039).
+
+* fix(vst): invert thread model for always_on — show_editor on main thread (#1204)
+
+Pedalboard 0.9.x asserts that ``show_editor`` runs on the process main thread. The old
+  ``editor_held_open`` ran the editor on a daemon thread and the render loop on main, so
+  ``always_on`` reliably crashed every launcher subprocess with ``RuntimeError: Plugin UI windows
+  can only be shown from the main thread.``
+
+Replace the contextmanager with ``run_with_editor_held_open(plugin, body)``: the caller (process
+  main) blocks in ``show_editor``; ``body()`` runs on a worker thread and its return value /
+  exceptions propagate after ``show_editor`` returns. Hoist the ``_render_in_batches`` loop into a
+  local ``_render_loop`` and dispatch on cadence — ``always_on`` calls the helper, everything else
+  inlines.
+
+Smoke-verified on Surge XT under the docker headless wrapper: parameter mutation and ``process()``
+  are safe off the main thread while the editor is realised on main.
+
+Delete ``editor_held_open``, ``EditorStartTimeout``, and ``_EDITOR_START_TIMEOUT_SECONDS`` — they
+  defended an invariant of the old model. Keep ``_EDITOR_JOIN_TIMEOUT_SECONDS`` for the worker join.
+  Update tests to pin the new contract, including the
+  ``test_render_in_batches_always_on_propagates_worker_exception`` shape of the old
+  ``EditorStartTimeout`` propagation pin.
+
+* fix(vst): raise RenderWorkerLeaked on join-window miss
+
+Closes the non-daemon-thread leak path Copilot flagged on PR #1204: ``run_with_editor_held_open``
+  previously logged a warning and returned when the worker outlived the join window, letting callers
+  like ``_render_in_batches`` continue while renders/file writes were still in flight on the
+  background thread.
+
+The worker is now a daemon (so a missed join cannot block interpreter shutdown) and the helper
+  raises a new ``RenderWorkerLeaked`` exception on either join-timeout or empty-result clean exit.
+  Body exceptions still take precedence so a slow body that raises surfaces its own failure.
+
+Workflow comments updated alongside: the matrix header now describes ``run_with_editor_held_open``
+  (not the deleted ``editor_held_open`` handshake), and ``generate-dataset-shards`` notes the 40-min
+  step cap.
+
+* fix(ci): assert always_on validator raise instead of pinning plugin_reload_cadence
+
+Drop the global `plugin_reload_cadence: once` pin from smoke-shard.yaml (72f9c6a8). The pin made the
+  matrix's `always_on` cells pass by dodging `RenderConfig._always_on_requires_plugin_reload_once`,
+  but it also changed the other six cells' semantics — they ran with `once` instead of the schema
+  default `render`, so the matrix stopped exercising the default codepath.
+
+Split the matrix in `test-dataset-generation-render-matrix.yml`:
+
+* `generate` job (positive cells) — six cells (never/once/render x hdf5/wds) running through
+  `generate-dataset-shards.yaml`. Each cell now composes against the schema-default
+  `plugin_reload_cadence="render"`, restoring default-codepath coverage. *
+  `validator_rejects_always_on` job (contract cells) — two inline cells (always_on x hdf5/wds)
+  invoking `synth-setter-generate-dataset` with `continue-on-error` and asserting both that the
+  launcher exited non-zero AND that the `_always_on_requires_plugin_reload_once` message was
+  surfaced. Inline because step-level `continue-on-error` doesn't compose into a reusable-workflow
+  caller; no cloud creds / docker required since the validator fires inside `spec_from_cfg` before
+  any side effect.
+
+Positive `always_on` end-to-end coverage already lives in
+  `test-vst-slow.yml::test_always_on_renders_small_shard_end_to_end` against a real Surge XT plugin.
+
+Adds `test_always_on_with_default_plugin_reload_cadence_raises` to
+  `tests/pipeline/test_schemas/test_dataset_spec.py` to pin the validator contract at unit level
+  (parallel to the existing `test_always_on_rejected_with_reload_render`, which only covers the
+  explicit `"render"` value — this one exercises the default-factory path the production callers
+  actually hit).
+
+* feat(ci): always validate shards after generate in generate-dataset-shards
+
+Adds an inline `python -m synth_setter.pipeline.ci.validate_shard ${spec_uri}` step that runs in the
+  same job (no cross-job output, no matrix-collapse) after every generate. Closes the contract-drift
+  gap that #1214 hit on the float16/float32 dtype mismatch — now every caller of this reusable
+  workflow validates shards against the `check_shard_contracts` contract before claiming success.
+
+Refs #1224 (workflow file rename to reflect the new behaviour).
+
+* refactor(ci): render-matrix axes are gui_toggle_cadence x plugin_reload_cadence
+
+Per ktinubu feedback: the matrix's intent is to exercise the `RenderConfig` cross-field validator
+  contract, so the axes should be the two cadence fields the validator pairs (not the output_format
+  axis). 7 positive cells + 1 contract cell that asserts the validator rejects `always_on x render`.
+
+Output format is fixed at hdf5 for all cells; #1226 tracks re-adding the output_format axis as a
+  follow-up.
+
+* fix(configs): materialize render.plugin_reload_cadence in smoke-shard
+
+Hydra treats the `render` config as a struct (the schema doesn't declare `plugin_reload_cadence`),
+  so the matrix's `render.plugin_reload_cadence=<cell>` overrides raised `ConfigAttributeError`
+  before reaching the Pydantic cross-field validator. Materializing the field in smoke-shard.yaml at
+  the Pydantic schema default (`render`) gives Hydra a known key for matrix overrides to target.
+  Mirrors the existing `gui_toggle_cadence: never` anchor.
+
+### Chores
+
+- **claude-md**: Add unprefixed QRSPI slash-command aliases
+  ([#1225](https://github.com/tinaudio/synth-setter/pull/1225),
+  [`c88de04`](https://github.com/tinaudio/synth-setter/commit/c88de04012c835b658d70e6309069447503284a2))
+
+* chore(claude-md): add unprefixed QRSPI slash-command aliases
+
+Add 8 shim files under `.claude/commands/qrspi-*.md` that delegate to the namespaced
+  `tinaudio-synth-setter-skills:qrspi-*` skills via the Skill tool. Lets users invoke
+  `/qrspi-research`, `/qrspi-questions`, etc. without the plugin prefix; canonical implementation
+  continues to live in the installed plugin. Mirrors the existing `repo-review` shim pattern.
+
+Refs #1221
+
+* chore(claude-md): tighten qrspi-implement shim description and arg hint
+
+Address WARNs from /repo-review-full-no-comments: - description shortened so the slash-command
+  picker shows the full text without trailing truncation. - argument-hint `[--flag]` placeholder
+  replaced with the real flag `[--pause]` (opts back into the human-confirmation gate between
+  phases).
+
+### Testing
+
+- **evaluation**: Pin compute_audio_metrics + predict_vst_audio CLI contracts
+  ([#1205](https://github.com/tinaudio/synth-setter/pull/1205),
+  [`3a13e19`](https://github.com/tinaudio/synth-setter/commit/3a13e19d142825a98aaecc966da358df37539415))
+
+* test(evaluation): pin compute_audio_metrics + predict_vst_audio CLI contracts
+
+Phase 0 of the wandb-metrics plan locks down the current behavior of two CLIs
+  (`compute_audio_metrics` and `predict_vst_audio`) with golden assertions on file layout, CSV
+  schema, and aggregated scalar values, so the Phase 1–2 refactors (extracting `compute_metrics()` /
+  `render_predictions()` library helpers and wiring them through `PredictionWriter`) can be proven
+  not to regress.
+
+Adds two session-scoped fixtures in `tests/evaluation/conftest.py`: `fixture_audio_dir` materialises
+  two `sample_*/{pred.wav,target.wav}` pairs (1 s stereo @ 44.1 kHz), and `fixture_pred_dir`
+  materialises `pred-0.pt` / `target-audio-0.pt` / `target-params-0.pt` for `surge_simple`. The
+  aggregated-metrics snapshot is committed alongside the test (not regenerated each run) so
+  cross-version drift surfaces as a test failure, not a silent baseline shift.
+
+Combined pin-test runtime is 3.3 s on CPU, well under the plan's 60 s cap.
+
+Refs #1203
+
+* docs(evaluation): correct --no-params docstring on predict_vst_audio pin test
+
+``--no-params`` does not suppress ``params.csv``; it writes the file with ``target`` set to NaN. The
+  pin test's module docstring described the behavior as if the file were omitted, contradicting the
+  actual CLI and the existing ``test_main_no_params_writes_pred_target_csv_and_spectrogram``
+  contract in ``tests/evaluation/test_predict_vst_audio.py``.
+
+Refs #1205
+
+* test(evaluation): strengthen Phase 0 pin tests (repo-review-full followup)
+
+Two strengthening fixes from the /repo-review-full WARNs on PR #1205:
+
+* rms tolerance: assert ``rms`` mean/std with ``rel=1e-2`` only (no ``abs`` floor); the snapshot
+  ``rms`` std (~1.7e-6) sat at the same magnitude as the prior ``abs=1e-6`` floor, so a Phase 1
+  refactor collapsing ``rms`` variability would have passed silently. * fixture symmetry: draw
+  ``target-params-0.pt`` from a distinct RNG seed so the ``params.csv`` ``pred``/``target`` columns
+  are guaranteed to differ row-wise. The prior ``encoded.copy()`` made them bit-identical under
+  ``-t``, so a Phase 2 column-swap bug would have slipped past the layout pin.
+
+Audio fixture is unchanged, so the committed ``compute_audio_metrics_aggregated.csv`` snapshot is
+  still valid; no re-record needed. Pin-test suite runtime: 3.4s combined.
+
+* test(evaluation): pin negative effects of --skip-spectrogram and --no-params
+
+The wav-layout pin invoked the CLI with both suppression flags but only asserted the presence of
+  ``pred.wav`` and ``target.wav``. Adding negative assertions — no ``spec.png`` under
+  ``--skip-spectrogram``, ``target`` column NaN under ``--no-params`` — closes the gap Copilot
+  flagged in the post-fix review.
+
+* test(evaluation): pin metrics.csv per-sample values (revert prior schema-only tradeoff)
+
+- Pin metrics.csv row count (2), sample-index ordering, and per-cell values against a committed
+  snapshot using the same rel=1e-2 (rms pure-rel) tolerance as the aggregated snapshot. Phase 1
+  extraction may legitimately reshape this CSV; if so the refactor PR refreshes the snapshot
+  alongside the production change, making the behavior change explicit in the diff. Refs #1205
+  https://github.com/tinaudio/synth-setter/pull/1205#discussion_r3275656620
+
+* test(evaluation): sort metrics.csv pin to ignore filesystem-order drift
+
+``Path.glob`` returns shards in filesystem-order, which differs between the Linux ext4 runner (``[1,
+  0]``) and the conda runner that hit ``[0, 1]``. Sorting both ``actual`` and ``snapshot`` by index
+  before the equality and per-cell lookups removes the cross-runner skew without weakening the pin —
+  the row set, count, and values are still checked exactly.
+
+* test(evaluation): clean up Phase 0 pin tests (Copilot review + cross-runner drift)
+
+- A1: _EXPECTED_METRIC_COLUMNS now a tuple (deterministic iteration); callers wrap with set(...)
+  where membership semantics are needed. - A2: per-sample snapshot header renamed `Unnamed: 0` ->
+  `sample_idx` so the committed CSV is self-describing (test loads index_col=0 either way). - A3:
+  rms baseline comment reworded — `compute_rms` is the cosine similarity of librosa RMS envelopes,
+  so identical inputs give ~1.0 (was misleading "rms cosine of 1"). - A4: _fake_render now consumes
+  signal_duration_seconds / sample_rate / channels positionally and returns int(sample_rate *
+  signal_duration_seconds) samples, honoring the CLI flags instead of a fixed 1024. - B: rms
+  tolerance widened from rel=1e-2 to rel=1e-1 in both test_aggregated_scalar_values_within_tolerance
+  and test_metrics_csv_per_sample_values — librosa float drift on Python 3.11 vs 3.10 produces a ~5%
+  delta on the rms std (~1.7e-6), which slipped past the previous 1% band on ubuntu-latest 3.11 (run
+  26177508999 job 77011380368).
+
+* test(evaluation): tighten rms tolerance — keep mean strict, absorb std float noise
+
+The prior commit (aadc077) widened both ``rms`` mean AND std to ``rel=1e-1`` to absorb the ubuntu
+  3.11 librosa drift. That was overly loose on the mean: the ``rms`` cosine-similarity mean is
+  anchored at 1.0 (0.99999867 in the snapshot; 0.9999999 / 0.99999744 per sample) and shows no
+  cross-runner drift, so a real regression dropping the mean to 0.91 would slip through silently
+  under ``rel=1e-1``.
+
+Tighten: - ``rms mean``: ``rel=1e-2, abs=1e-6`` (same as the distance metrics) - ``rms std``
+  (aggregated only, snapshot value 1.74e-6, observed ~5% drift): ``abs=1e-5`` — purely absolute,
+  absorbs the float-noise drift at the noise floor without inflating the mean tolerance. -
+  Per-sample rms: uniform ``rel=1e-2, abs=1e-6`` — no special case (per-sample values are anchored
+  at 1.0 with no observed cross-runner drift).
+
+* docs(evaluation): correct rms tolerance description in module docstring
+
+Module docstring still claimed ``rel=1e-1`` for rms, but ca5d66d tightened the mean to ``rel=1e-2,
+  abs=1e-6`` (same band as the distance metrics) and moved the slack to the aggregated std only
+  (``abs=1e-5``). Bring the docstring up to date so the contract description matches the actual
+  assertions.
+
+
 ## v8.5.0 (2026-05-20)
 
 ### Continuous Integration
