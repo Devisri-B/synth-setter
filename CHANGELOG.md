@@ -1,6 +1,253 @@
 # CHANGELOG
 
 
+## v8.5.2 (2026-05-22)
+
+### Bug Fixes
+
+- **deps**: Pin kubernetes==35.0.0 — unblock SkyPilot pod_config validation
+  ([#1242](https://github.com/tinaudio/synth-setter/pull/1242),
+  [`205d176`](https://github.com/tinaudio/synth-setter/commit/205d176a86949b9515f7ec9379d8e8e0216da9e8))
+
+* fix(deps): pin kubernetes==35.0.0 to unblock SkyPilot pod_config
+
+kubernetes 36.0.0 (uploaded 2026-05-20) broke SkyPilot 0.12.0 pod_config validation with `No module
+  named 'kubernetes.client.models.dict[str, str]'`, failing the hourly `Test Dataset Generation`
+  cron since 2026-05-20T23:30Z. Diagnostic PR #1241 confirmed pinning kubernetes==35.0.0 restores
+  the workflow.
+
+Pins kubernetes==35.0.0 in three places so neither the launcher venv, the skypilot-local smoke
+  runner, nor any future install of the package can pull in 36.x: - pyproject.toml
+  [project].dependencies (pipeline group) - .github/workflows/generate-dataset-shards.yaml launcher
+  install + cache key bump (k8s35-) so warm caches cannot mask the pin -
+  .github/workflows/test-skypilot-local.yml install line
+
+Closes #1239
+
+* docs(pyproject): note co-pin obligation for kubernetes==35.0.0
+
+Mirror the sync-note pattern used for skypilot==0.12.0 so future maintainers see all three pin sites
+  at a glance.
+
+Refs #1239
+
+### Continuous Integration
+
+- **cpu-slow**: Inject RCLONE_CONFIG_R2_* secrets so integration_r2 tests run
+  ([#1206](https://github.com/tinaudio/synth-setter/pull/1206),
+  [`c5f1891`](https://github.com/tinaudio/synth-setter/commit/c5f18917e1bd3919a4ddc9916a444c3220e759b3))
+
+* ci(cpu-slow): inject RCLONE_CONFIG_R2_* secrets so integration_r2 tests run
+
+`integration_r2`-marked tests carry `slow`, so they collect into the `cpu-slow.yml` pytest
+  invocation. Without the rclone-prefixed R2 env vars they short-circuit via
+  `r2_io.is_r2_reachable()` and skip silently, leaving the `integration_r2` surface with no
+  scheduled coverage.
+
+Wire the same `RCLONE_CONFIG_R2_*` secret block used by `generate-dataset-shards.yaml` and
+  `test-local-launcher-roundtrip.yml` into the `Run slow` step. On fork PRs without secrets the gate
+  still auto-skips cleanly — no regression.
+
+A new `tests/infra/test_cpu_slow_workflow_r2_creds.py` parses the workflow and pins both the
+  presence of the three env keys and the secret-name convention, so a future workflow restructure
+  can't drop the keys unnoticed.
+
+Closes #1185
+
+* fix(cpu-slow): include RCLONE_CONFIG_R2_TYPE/PROVIDER so is_r2_reachable passes
+
+`is_r2_reachable()` shells out to `rclone lsd r2:` without applying the `_R2_STRUCTURAL_DEFAULTS`
+  setdefault that `ensure_r2_env_loaded()` does, so the workflow must export
+  `RCLONE_CONFIG_R2_TYPE=s3` and `RCLONE_CONFIG_R2_PROVIDER=Cloudflare` itself or rclone errors with
+  `didn't find section in config file` and every `integration_r2` test skips silently — the exact
+  bug #1185 was filed to fix.
+
+Mirrors `.github/workflows/test-local-launcher-roundtrip.yml:65-66`.
+
+Widens the invariant test to use the union of `_SECRET_R2_ENV_KEYS` +
+  `_R2_STRUCTURAL_DEFAULTS.keys()` imported directly from `r2_io`, so a future workflow regression
+  that drops either set fails loudly instead of producing a false-green check. Also rolls in the
+  prior-round Copilot nits (rclone install step, parametrized secret test, `cast(...)` type object)
+  so the branch carries one consolidated review-resolution commit.
+
+Refs #1206 Repo-review-full BLOCK: ".github/workflows/cpu-slow.yml:67 — injects only the three
+  secret R2 env keys but omits `RCLONE_CONFIG_R2_TYPE: s3` and `RCLONE_CONFIG_R2_PROVIDER:
+  Cloudflare`; `is_r2_reachable()` cannot recover via `_R2_STRUCTURAL_DEFAULTS` because that
+  `setdefault` lives in `ensure_r2_env_loaded()` only."
+
+* ci(cpu-slow): self-trigger on PR when cpu-slow.yml or its invariant test is modified
+
+- Catch workflow regressions at PR-time instead of waiting for the post-merge push run on main to
+  surface them.
+
+Refs #1206
+
+* ci(cpu-slow): gate against fork PRs + loosen env-value assertion (Copilot review)
+
+- `.github/workflows/cpu-slow.yml`: add job-level `if:` guard on `run_slow_tests` so the 90-min
+  suite skips on fork-PR triggers, where `secrets.RCLONE_CONFIG_R2_*` are unavailable and the
+  `integration_r2` surface skips silently anyway. `workflow_dispatch` / `push` / `schedule` remain
+  unaffected. Resolves Copilot finding on cpu-slow.yml:23. -
+  `tests/infra/test_cpu_slow_workflow_r2_creds.py`: switch the secret-env assertion from
+  exact-string equality to `re.fullmatch` so equivalent GitHub expressions (`${{secrets.X}}`, extra
+  whitespace) no longer trip the invariant on harmless formatting changes. Resolves Copilot finding
+  on test_cpu_slow_workflow_r2_creds.py:136. - Add `test_cpu_slow_job_gated_against_fork_prs` so a
+  future restructure that drops the fork-PR guard regresses loudly instead of silently burning
+  runner-minutes.
+
+- **testing**: Cleanup coverage config + add slow-cpu Codecov flag
+  ([#1211](https://github.com/tinaudio/synth-setter/pull/1211),
+  [`39281d4`](https://github.com/tinaudio/synth-setter/commit/39281d4b116711b7190b91241d34eca341475af2))
+
+* ci(testing): cleanup coverage config + add slow-cpu Codecov flag
+
+- Delete `.github/codecov.yml` (root `codecov.yml` is canonical; the 10-line stub was silently
+  ignored by Codecov's precedence). - Fix `[tool.coverage.report].exclude_lines` to use the
+  canonical `pragma: no cover` token (with space). The old `pragma: nocover` spelling was
+  non-standard and never matched anything. - Collect coverage in `cpu-slow.yml` and upload under a
+  dedicated `slow-cpu` Codecov flag. The slow CPU suite exercises PyTorch forward passes and
+  pipeline paths that the fast `unit-cpu` suite skips, so those lines were reading as 0% covered. -
+  Register the new `slow-cpu` flag in `codecov.yml`'s `flag_management` so carryforward and path
+  scoping match `unit-cpu`.
+
+Refs #14
+
+* chore(lint): tighten cpu-slow Codecov upload comment to 2 lines
+
+CLAUDE.md caps inline comments at two lines; collapse the 3-line preamble to lead with the
+  load-bearing rationale (flag separability) and drop the restated context about what the slow CPU
+  suite covers — the file header at lines 3-8 already says it.
+
+### Refactoring
+
+- **pipeline**: Front-load validation in dispatch_via_skypilot before side effects
+  ([#1220](https://github.com/tinaudio/synth-setter/pull/1220),
+  [`ce86991`](https://github.com/tinaudio/synth-setter/commit/ce869916ef69aff7cea0bab018634ad2dae8d48d))
+
+* refactor(pipeline): front-load validation in dispatch_via_skypilot before side effects
+
+Split `dispatch_via_skypilot` into a strict Phase-1 (validation) / Phase-2 (commit) structure so a
+  misconfigured dispatch never clobbers `~/.sky/config.yaml`, mutates `os.environ`, or emits the
+  spec-uri sentinel before every prerequisite — including worker R2 creds — is verified. The
+  credential check moves above `_ensure_ci_sky_config`, `_emit_spec_uri`, the api-server env
+  mutation, the RCLONE mirror, and `_run_cred_bootstrap`.
+
+Also delete the `_resolve_spec_uri` subprocess hop to the `synth-setter-spec-uri` console script:
+  the launcher now calls `compute_spec_uri(spec_path)` in-process from `cli/main`. The console
+  script is unaffected (still exported, still tested) but no longer has a production caller.
+
+Test additions: - `test_phase1_failures_skip_phase2_side_effects` — parametrized over every Phase-1
+  raise (missing template/cmd, api-server+local, bad job_name, bad worker_image_tag, missing creds)
+  and asserts neither `~/.sky/config.yaml` nor `sky.jobs.launch` was touched. -
+  `test_phase1_failure_emits_no_spec_uri_sentinel` — asserts a missing-cred dispatch raises before
+  printing the `::synth-setter-spec-uri::` marker the CI workflow greps for.
+
+Existing `test_invokes_spec_uri_cli_with_discovered_path` becomes
+  `test_passes_discovered_spec_path_to_compute_spec_uri`; the shared
+  `_stub_check_output_returns_uri` helper becomes `_stub_compute_spec_uri_returns`.
+
+Closes #1218 Refs #1125
+
+* docs(reference): describe in-process spec URI derivation in launcher
+
+Three references still described the now-removed `_resolve_spec_uri` subprocess hop to
+  `synth-setter-spec-uri`. After the parent commit on this branch the launcher parses the discovered
+  spec once and reads `spec.r2.input_spec_uri()` off the model. Doc-drift advisory flagged
+  configuration-reference.md (two spots) and skypilot-compute-integration.md (one note); both
+  updated to match current behavior.
+
+Refs #1218
+
+* test(pipeline): pin sentinel-after-cred-bootstrap ordering in dispatch_via_skypilot
+
+A `_run_cred_bootstrap` raise must skip `_emit_spec_uri` so the `::synth-setter-spec-uri::` sentinel
+  a CI workflow greps from the launcher log implies the cred bootstrap step succeeded, not just that
+  Phase-1 cleared. Before this commit the invariant lived only in the Phase-2 inline comment and the
+  doc-map entry — a future contributor who re-promotes `_emit_spec_uri` above `_run_cred_bootstrap`
+  would not trip any test. Verified the new test fails when the two lines are swapped.
+
+- **test**: Dedupe `_render_cfg` helper across three vst test modules
+  ([#1212](https://github.com/tinaudio/synth-setter/pull/1212),
+  [`b998019`](https://github.com/tinaudio/synth-setter/commit/b998019c676f9093124038f2d92fbed0a920db52))
+
+* style(tests): ruff-format catch-up on test_generate_vst_dataset
+
+Pre-existing whitespace and line-length drift surfaced by ruff format. No behavior change —
+  preparing for the _render_cfg dedup commit so the intent diff stays small.
+
+* refactor(tests): dedupe `_render_cfg` helper across three vst test modules
+
+The three vst test modules each had a near-identical `_render_cfg` factory that built a Surge XT
+  `RenderConfig` from the same constants. The always_on variant only differed by pinning
+  `plugin_reload_cadence="once"` and `gui_toggle_cadence="always_on"`.
+
+Generalize the canonical helper in `test_generate_vst_dataset.py` with keyword-only
+  `plugin_reload_cadence` and `gui_toggle_cadence` parameters (defaults preserve existing behaviour)
+  and import it from `test_writers_wds_e2e.py` and `test_always_on_integration.py` — both already
+  follow the same pattern for `_HARDCODED_*` constants.
+
+The single `always_on` call site now passes the held-open pairing inline; the local wrapper function
+  is no longer needed.
+
+* refactor(tests): centralize `_PLUGIN_PATH` alongside `_render_cfg`
+
+Import the canonical `_PLUGIN_PATH` from `test_generate_vst_dataset` in the two consumer modules so
+  the local `skip_no_vst` mark tracks the same plugin path that the shared `_render_cfg` helper
+  embeds in the produced `RenderConfig`. A local copy could drift from the canonical default and
+  cause confusing skip/failure asymmetry.
+
+Refs #1208
+
+### Testing
+
+- **data-pipeline**: Add cfg_dataset fixtures + repo-root generate_dataset parity test
+  ([#1229](https://github.com/tinaudio/synth-setter/pull/1229),
+  [`56061b8`](https://github.com/tinaudio/synth-setter/commit/56061b80f2240f0b97d3baecd6c624d97843f004))
+
+* test(data-pipeline): add cfg_dataset fixtures + repo-root parity test
+
+Mirror the cfg_train_global/cfg_train fixture pair for the generate_dataset CLI. New
+  tests/test_generate_dataset_shards.py asserts that the new fixture composes dataset.yaml via the
+  generate_dataset/smoke-shard experiment and round-trips through DatasetSpec. Sets up the conftest
+  surface for a follow-up VST-gated e2e test (Phase 2 of the QRSPI plan).
+
+cfg_dataset_global drops return_hydra_config=True so the hydra.* sub-tree (whose sweep.subdir
+  interpolates the runtime-only ${hydra.job.num}) does not leak into spec_from_cfg's resolve=True
+  container round-trip. cfg_dataset annotates Iterator[DictConfig] + :yields: section so pydoclint
+  accepts the yielding fixture without a new baseline row. Collateral: regenerates the baseline to
+  drop stale DOC203 rows (no longer detected with check-return-types=false).
+
+Refs #1227
+
+* docs(tests): rewrite module docstring to describe spec_from_cfg round-trip
+
+Drop the forward-looking "@hydra.main-decorated entry" language — Phase 1 only exercises
+  spec_from_cfg. Phase 2 will revise this docstring when it adds the from_hydra e2e test.
+
+Refs #1228
+
+- **data-pipeline**: Migrate wds finalize_dataset tests to fake_r2_remote
+  ([#1217](https://github.com/tinaudio/synth-setter/pull/1217),
+  [`29e9b48`](https://github.com/tinaudio/synth-setter/commit/29e9b4801454cc79f080a0c2960b6ad8d701ee5d))
+
+Replace patch_finalize_io's recording-list stubs with the fake_r2_remote fixture so finalize's wds
+  download/upload paths exercise the real rclone binary end-to-end against a local-typed remote.
+  Tests assert on materialized files under fake_r2_remote instead of introspecting mock call lists.
+
+object_size and ensure_r2_env_loaded stay stubbed: the local rclone backend exits 3 on an absent key
+  (instead of returning empty stdout the S3-compatible backends give), and the auth ping needs real
+  R2 secrets.
+
+Ordering invariant (marker uploaded after stats) is preserved via an mtime comparison on the two
+  materialized files; mutation-verified by swapping the upload order in main() and confirming the
+  assertion fails.
+
+Three lower-level wds tests (downloads_every_train_shard_uri, raises_on_empty_train_split,
+  unlinks_each_shard_after_folding) are migrated to use fake_r2_remote with spy wrappers around the
+  real download_to_path so the URI-ordering and peak-disk assertions exercise production transport.
+  The hdf5 branch's tests (added in #1202) already use fake_r2_remote and are left untouched.
+
+
 ## v8.5.1 (2026-05-20)
 
 ### Bug Fixes
