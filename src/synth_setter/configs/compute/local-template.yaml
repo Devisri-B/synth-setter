@@ -16,6 +16,17 @@
 # cluster via `kind load docker-image` ahead of launch. `image_id` is set
 # per-launch by the launcher from skypilot_launch.worker_image_tag.
 
+# Task-scoped (not ~/.sky/config.yaml): a global override blocks the
+# SkyPilot jobs controller, whose image lives on GAR and is not `kind
+# load`-ed. Name-less container merges into the pod's first container
+# via SkyPilot's patch-merge legacy. See #1255.
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        containers:
+          - imagePullPolicy: Never
+
 resources:
   cloud: kubernetes
   # Resource floor: shrunk from `cpus: 2+` to fit kind's allocatable headroom
