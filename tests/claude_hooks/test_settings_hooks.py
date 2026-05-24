@@ -26,7 +26,11 @@ def _load_settings() -> dict[str, Any]:
 
 
 def _matcher_entries() -> list[dict[str, Any]]:
-    """Return every PreToolUse/PostToolUse matcher-entry in source order.
+    """Return every matcher-entry across all hook events in source order.
+
+    Iterates every value of the top-level ``hooks`` map — currently
+    ``SessionStart``, ``PreToolUse``, and ``PostToolUse`` — so any new hook
+    event added under ``hooks`` is picked up automatically.
 
     :returns: Flat list of matcher-entry objects.
     """
@@ -164,6 +168,8 @@ _EXPECTED_SHARED_HOOK_COMMANDS: tuple[tuple[str, str], ...] = (
     ("No-yaml-run-comments", "bash agent/hooks/no-yaml-run-comments.sh"),
     ("PR review resolver", "bash agent/hooks/pr-review-resolver.sh"),
     ("Taxonomy verification", "bash agent/hooks/verify-gh-taxonomy.sh"),
+    ("Worktree guard", "bash agent/hooks/worktree-guard.sh"),
+    ("Worktree-status banner", "bash agent/hooks/session-start-cwd-banner.sh"),
 )
 
 
