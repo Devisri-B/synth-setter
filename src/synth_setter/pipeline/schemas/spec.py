@@ -478,6 +478,11 @@ class DatasetSpec(BaseModel):
 
         Nested ``RenderConfig`` carrying every per-shard renderer input.
 
+    .. attribute :: mask_degenerate_bins
+
+        Whether finalize substitutes ``std=1.0`` at zero-variance mel bins
+        instead of raising; ``False`` is the strict production default.
+
     .. attribute :: git_sha
 
         Commit SHA of the launcher's working tree at construction.
@@ -533,6 +538,16 @@ class DatasetSpec(BaseModel):
 
     render: RenderConfig = Field(
         description="Nested ``RenderConfig`` carrying every per-shard renderer input."
+    )
+
+    mask_degenerate_bins: bool = Field(
+        default=False,
+        description=(
+            "Whether the finalize stats fold substitutes ``std=1.0`` at zero-variance "
+            "mel bins instead of raising; ``False`` is the strict production default. "
+            "Smoke configs override to ``True`` because tiny renders have constant "
+            "attack-time frames and channels below the source's active bandwidth."
+        ),
     )
 
     # Auto-filled runtime fields: factories fire only when the value is missing on
@@ -644,6 +659,26 @@ class DatasetSpec(BaseModel):
             data = dict(data)
             for computed_key in cls.model_computed_fields:
                 data.pop(computed_key, None)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_run_id(cls, data: Any) -> Any:
+        """Drop ``run_id`` when ``None`` so its ``default_factory`` fires.
+
+        ``configs/dataset.yaml`` materializes ``run_id: null`` so the finalize
+        workflow's ``run_id=<value>`` Hydra override resolves against an
+        existing key. When that override is not pinned, the composed cfg
+        arrives with ``run_id=None`` — letting it reach the field validator
+        would fail strict ``str`` validation instead of falling back to the
+        ``task_name``+``created_at`` default factory.
+
+        :param data: Raw input to the validator (typically a dict; pass-through otherwise).
+        :returns: ``data`` unchanged, or a copy with the ``None`` ``run_id`` popped.
+        """
+        if isinstance(data, dict) and data.get("run_id", "sentinel") is None:
+            data = dict(data)
+            data.pop("run_id")
         return data
 
     @field_validator("train_val_test_sizes", mode="before")
