@@ -5776,6 +5776,20 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+kubernetes = [
+    { name = "aiohttp" },
+    { name = "aiosqlite" },
+    { name = "anyio" },
+    { name = "casbin" },
+    { name = "grpcio" },
+    { name = "kubernetes" },
+    { name = "passlib" },
+    { name = "protobuf" },
+    { name = "pyjwt" },
+    { name = "python-dateutil" },
+    { name = "sqlalchemy-adapter" },
+    { name = "websockets" },
+]
 oci = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
@@ -6008,8 +6022,8 @@ wheels = [
 
 [[package]]
 name = "synth-setter"
-version = "8.7.2"
-source = { virtual = "." }
+version = "8.7.4"
+source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "dask", extra = ["distributed"] },
@@ -6043,7 +6057,7 @@ dependencies = [
     { name = "runpod" },
     { name = "scipy" },
     { name = "sh" },
-    { name = "skypilot", extra = ["oci", "runpod"] },
+    { name = "skypilot", extra = ["kubernetes", "oci", "runpod"] },
     { name = "structlog" },
     { name = "tenacity" },
     { name = "tensorboard" },
@@ -6215,7 +6229,7 @@ requires-dist = [
     { name = "runpod", specifier = "==1.8.1" },
     { name = "scipy", specifier = ">=1.14,<1.15" },
     { name = "sh" },
-    { name = "skypilot", extras = ["runpod", "oci"], specifier = "==0.12.0" },
+    { name = "skypilot", extras = ["runpod", "oci", "kubernetes"], specifier = "==0.12.0" },
     { name = "structlog" },
     { name = "synth-setter", extras = ["torch", "dev"], marker = "extra == 'all'" },
     { name = "tenacity" },
