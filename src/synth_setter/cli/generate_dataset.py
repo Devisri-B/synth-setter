@@ -20,6 +20,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+import click
 import hydra
 from hydra import compose, initialize_config_module
 from loguru import logger
@@ -27,6 +28,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from synth_setter.data.vst.core import extract_renderer_version
 from synth_setter.pipeline import r2_io
+from synth_setter.pipeline.constants import WORKER_SPEC_URI_ENV
 from synth_setter.pipeline.partitioning import (
     available_cpus,
     get_my_shards,
@@ -60,6 +62,11 @@ _OPERATOR_WORKSPACE = operator_workspace()
 # Worker-side checkout path — baked WORKDIR of the dev-snapshot image, not the
 # launcher's workspace (which may not exist on the worker filesystem).
 _WORKER_REPO_ROOT = "/home/build/synth-setter"
+
+# Stdout marker the CI workflow greps out of the tee'd launcher log to populate
+# the workflow's ``spec_uri`` output. Emitted from ``main`` before any dispatch
+# so the marker is visible on the launcher host regardless of provider.
+_SPEC_URI_STDOUT_SENTINEL = "::synth-setter-spec-uri::"
 
 
 def _rclone_copy(src: str, dest: str) -> None:
@@ -380,7 +387,39 @@ def _sky_cfg_from_dataset_cfg(cfg: DictConfig) -> SkypilotLaunchConfig:
             "skypilot_launch.cmd is launcher-internal and cannot be set from Hydra; "
             "the worker-side bash one-liner is built from argv by main()."
         )
+    if sky_kwargs.get("extra_envs"):
+        raise ValueError(
+            "skypilot_launch.extra_envs is launcher-internal and cannot be set from Hydra; "
+            "main() injects dataset-specific worker envs (e.g. WORKER_SPEC_URI)."
+        )
     return SkypilotLaunchConfig(**sky_kwargs)
+
+
+def _smoke_job_name(spec: DatasetSpec) -> str:
+    """Build the dataset-flavored SkyPilot job-name stem from ``spec.task_name``.
+
+    The first 8 chars of ``task_name`` are interpolated into the
+    ``synth-setter-smoke-<…>`` stem. Validated against the launcher's
+    k8s-label-subset grammar so a malformed ``task_name`` raises here with a
+    domain-specific message, not later from inside ``dispatch_via_skypilot``
+    where the spec is no longer in scope.
+
+    :param spec: Validated dataset spec.
+    :return: Job-name stem matching the launcher's ``_JOB_NAME_RE`` grammar.
+    :raises ValueError: ``spec.task_name[:8]`` would produce a stem outside the
+        launcher grammar; fix ``spec.task_name`` or pin
+        ``skypilot_launch.job_name``.
+    """
+    from synth_setter.pipeline.skypilot_launch import _JOB_NAME_RE
+
+    stem = f"synth-setter-smoke-{spec.task_name[:8]}"
+    if not _JOB_NAME_RE.fullmatch(stem):
+        raise ValueError(
+            f"derived job-name stem {stem!r} contains characters outside "
+            f"{_JOB_NAME_RE.pattern}; fix spec.task_name or pin "
+            "skypilot_launch.job_name explicitly."
+        )
+    return stem
 
 
 def _build_worker_cmd(overrides: list[str], spec: DatasetSpec) -> str:
@@ -462,6 +501,12 @@ def main() -> None:
     r2_uri = upload_spec(spec)
     logger.info(f"spec uploaded -> {r2_uri}")
 
+    # ``input_spec_uri()`` (not ``uri(INPUT_SPEC_FILENAME)``) — the former
+    # includes the run's prefix so the worker reads the same canonical object
+    # ``main()`` just uploaded.
+    spec_uri = spec.r2.input_spec_uri()
+    click.echo(f"{_SPEC_URI_STDOUT_SENTINEL}{spec_uri}")
+
     if sky_cfg.compute_template is None:
         run(spec)
         return
@@ -469,11 +514,14 @@ def main() -> None:
     # Deferred import — SkyPilot pulls heavy provider SDKs on import.
     from synth_setter.pipeline.skypilot_launch import dispatch_via_skypilot
 
-    sky_cfg = sky_cfg.model_copy(update={"cmd": _build_worker_cmd(overrides, spec)})
-    # ``input_spec_uri()`` (not ``uri(INPUT_SPEC_FILENAME)``) — the former
-    # includes the run's prefix so the worker reads the same canonical object
-    # ``main()`` just uploaded.
-    dispatch_via_skypilot(spec, sky_cfg, spec_uri=spec.r2.input_spec_uri())
+    sky_cfg = sky_cfg.model_copy(
+        update={
+            "cmd": _build_worker_cmd(overrides, spec),
+            "job_name": sky_cfg.job_name or _smoke_job_name(spec),
+            "extra_envs": {WORKER_SPEC_URI_ENV: spec_uri},
+        }
+    )
+    dispatch_via_skypilot(sky_cfg)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,11 @@ resolved separately via ``resolve_worker_env``.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, field_validator
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_ENV_IDENT_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
 class SkypilotLaunchConfig(BaseModel):
@@ -53,6 +57,15 @@ class SkypilotLaunchConfig(BaseModel):
     .. attribute :: local
 
         Run the job on the local SkyPilot context instead of remote.
+
+    .. attribute :: extra_envs
+
+        Caller-supplied env vars merged into every rank's worker env after
+        ``resolve_worker_env``. Keys must match ``[A-Z_][A-Z0-9_]*``
+        (uppercase-only env-var identifiers — POSIX-portable across the
+        shells SkyPilot exports to) and may not collide with the launcher's
+        resolved-env keys (use ``.env`` or process env for those); rank/world
+        keys injected later still win.
     """
 
     model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
@@ -66,6 +79,7 @@ class SkypilotLaunchConfig(BaseModel):
     tail: bool = False
     api_server: str | None = None
     local: bool = False
+    extra_envs: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("num_workers")
     @classmethod
@@ -94,3 +108,25 @@ class SkypilotLaunchConfig(BaseModel):
         if not v.strip():
             raise ValueError("api_server must be a non-empty URL when set")
         return v.strip()
+
+    @field_validator("extra_envs")
+    @classmethod
+    def extra_envs_keys_must_be_env_identifiers(cls, v: dict[str, str]) -> dict[str, str]:
+        """Reject keys that aren't uppercase env-var identifiers.
+
+        The accepted grammar (``[A-Z_][A-Z0-9_]*``) is intentionally narrower
+        than full POSIX — uppercase-only matches the convention every worker
+        env this launcher exports has followed historically, and keeps caller-
+        supplied vars visually distinct from shell locals on the worker side.
+
+        :param v: Candidate ``extra_envs`` mapping pre-validation.
+        :return: ``v`` unchanged when every key matches ``[A-Z_][A-Z0-9_]*``.
+        :raises ValueError: one or more keys violate the env-identifier grammar.
+        """
+        bad = [k for k in v if not _ENV_IDENT_RE.match(k)]
+        if bad:
+            raise ValueError(
+                "extra_envs keys must match the uppercase env-var grammar "
+                f"[A-Z_][A-Z0-9_]*; got invalid: {bad}"
+            )
+        return v

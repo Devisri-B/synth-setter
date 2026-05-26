@@ -33,6 +33,7 @@ import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1413,8 +1414,7 @@ class TestMainDispatchBranches:
 
         recorded: dict[str, object] = {}
 
-        def _fake_dispatch(spec: object, sky_cfg: object, **_kwargs: object) -> None:
-            recorded["spec"] = spec
+        def _fake_dispatch(sky_cfg: object) -> None:
             recorded["sky_cfg"] = sky_cfg
 
         monkeypatch.setattr(sl, "dispatch_via_skypilot", _fake_dispatch)
@@ -1629,15 +1629,77 @@ class TestMainSpecPersistence:
         call_names = [c[0] for c in manager.mock_calls]
         assert call_names.index("ensure_env") < call_names.index("upload_spec")
 
-    def test_dispatch_branch_passes_canonical_spec_uri_kwarg(
+    def test_dispatch_branch_passes_canonical_spec_uri_via_extra_envs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """``main()`` threads ``spec.r2.input_spec_uri()`` into ``dispatch_via_skypilot``.
+        """``main()`` forwards ``spec.r2.input_spec_uri()`` via ``sky_cfg.extra_envs``.
 
-        PR-2 contract: the launcher passes the canonical spec URI (including
-        the run's prefix) as a kwarg so the worker reads the same R2 object
-        ``main()`` just uploaded. Uses ``spec.r2.input_spec_uri()`` (not
-        ``spec.r2.uri(INPUT_SPEC_FILENAME)``) — the former includes the prefix.
+        The canonical spec URI (with run prefix) lands in
+        ``sky_cfg.extra_envs[WORKER_SPEC_URI_ENV]`` so each rank reads the same
+        R2 object ``main()`` just uploaded.
+
+        :param monkeypatch: Pytest fixture used to patch ``sys.argv`` + dispatch.
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        """
+        import synth_setter.cli.generate_dataset as gd
+        import synth_setter.pipeline.skypilot_launch as sl
+        from synth_setter.pipeline.constants import WORKER_SPEC_URI_ENV
+
+        template = self._write_minimal_template(tmp_path)
+        monkeypatch.setattr("sys.argv", self._dispatch_argv(template))
+
+        recorded: dict[str, object] = {}
+
+        def _fake_dispatch(sky_cfg: object) -> None:
+            recorded["sky_cfg"] = sky_cfg
+
+        monkeypatch.setattr(sl, "dispatch_via_skypilot", _fake_dispatch)
+
+        gd.main()
+
+        sky_cfg = recorded["sky_cfg"]
+        spec = gd.write_spec_locally.call_args[0][0]  # type: ignore[attr-defined]
+        assert isinstance(spec, DatasetSpec)
+        assert sky_cfg.extra_envs[WORKER_SPEC_URI_ENV] == spec.r2.input_spec_uri()  # type: ignore[attr-defined]
+
+    def test_main_emits_spec_uri_sentinel(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``main()`` prints ``::synth-setter-spec-uri::<uri>`` before dispatching.
+
+        The CI workflow greps the tee'd ``generate.log`` for this marker; the
+        sentinel must emit on the launcher host (not the worker) so it shows
+        up before any rank boots.
+
+        :param monkeypatch: Pytest fixture used to patch ``sys.argv`` + dispatch.
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        import synth_setter.cli.generate_dataset as gd
+        import synth_setter.pipeline.skypilot_launch as sl
+
+        template = self._write_minimal_template(tmp_path)
+        monkeypatch.setattr("sys.argv", self._dispatch_argv(template))
+        monkeypatch.setattr(sl, "dispatch_via_skypilot", lambda *_a, **_k: None)
+
+        gd.main()
+
+        out = capsys.readouterr().out
+        assert "::synth-setter-spec-uri::r2://" in out
+
+    def test_generate_dataset_pins_smoke_job_name(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """``main()`` pins the dataset-specific job-name stem before dispatching.
+
+        The launcher is domain-neutral; the dataset-specific
+        ``synth-setter-smoke-<task[:8]>`` stem lives on the caller side so the
+        worker job name still encodes the task.
 
         :param monkeypatch: Pytest fixture used to patch ``sys.argv`` + dispatch.
         :param tmp_path: Pytest fixture providing a fresh test directory.
@@ -1650,16 +1712,26 @@ class TestMainSpecPersistence:
 
         recorded: dict[str, object] = {}
 
-        def _fake_dispatch(spec: DatasetSpec, sky_cfg: object, **kwargs: object) -> None:
-            recorded["spec"] = spec
-            recorded["kwargs"] = kwargs
+        def _fake_dispatch(sky_cfg: object) -> None:
+            recorded["sky_cfg"] = sky_cfg
 
         monkeypatch.setattr(sl, "dispatch_via_skypilot", _fake_dispatch)
 
         gd.main()
 
-        spec = recorded["spec"]
-        assert isinstance(spec, DatasetSpec)
-        kwargs = recorded["kwargs"]
-        assert isinstance(kwargs, dict)
-        assert kwargs["spec_uri"] == spec.r2.input_spec_uri()
+        sky_cfg = recorded["sky_cfg"]
+        spec_call = gd.write_spec_locally.call_args[0][0]  # type: ignore[attr-defined]
+        assert sky_cfg.job_name == gd._smoke_job_name(spec_call)  # type: ignore[attr-defined]
+
+
+def test_smoke_job_name_rejects_unsafe_task_name() -> None:
+    """``_smoke_job_name`` raises with a task-name-aware diagnostic on malformed task_name.
+
+    Pins the dataset-aware error message that the launcher's
+    ``_JOB_NAME_RE`` validator would otherwise surface without spec context.
+    """
+    from synth_setter.cli.generate_dataset import _smoke_job_name
+
+    bad_spec = SimpleNamespace(task_name="bad.task.name")
+    with pytest.raises(ValueError, match=r"fix spec.task_name or pin"):
+        _smoke_job_name(bad_spec)  # type: ignore[arg-type]

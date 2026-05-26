@@ -4,16 +4,14 @@ Covers ``src/synth_setter/pipeline/skypilot_launch.py``. Mock-based: no real Sky
 calls. The ``mock_sky`` fixture replaces the launcher's module-level ``sky`` reference with a
 ``MagicMock`` so dispatch-side assertions can read submission shape without provisioning.
 
-The launcher's click CLI no longer composes a DatasetSpec — it shells out to an operator-
-supplied inner command (typically ``synth-setter-generate-dataset``) that writes the canonical
-``data/<task>/<run>/metadata/input_spec.json``, parses that spec once, forwards
-``spec.r2.input_spec_uri()`` as the canonical R2 URI, and dispatches via
-``dispatch_via_skypilot``. The ``TestCli`` class pins the new contract.
+``dispatch_via_skypilot(sky_cfg)`` is the only public surface; the tests exercise the validation
+funnel, the per-rank fan-out, and the uuid-stem job-name fallback.
 """
 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -21,23 +19,18 @@ from unittest.mock import MagicMock
 import click
 import pytest
 import yaml
-from click.testing import CliRunner
 
 from synth_setter.pipeline.constants import WORKER_SPEC_URI_ENV
 from synth_setter.pipeline.partitioning import NUM_WORKERS_ENV_VAR, WORKER_RANK_ENV_VAR
 from synth_setter.pipeline.schemas.skypilot_launch import SkypilotLaunchConfig
-from synth_setter.pipeline.schemas.spec import DatasetSpec
 from synth_setter.pipeline.skypilot_launch import (
     _SECRET_WORKER_ENV_KEYS,
     _SKYPILOT_API_SERVER_ENV,
-    _SPEC_URI_STDOUT_SENTINEL,
     _WORKER_ENV_KEYS,
-    _emit_spec_uri,
     _ensure_ci_sky_config,
     _override_image_id,
     dispatch_via_skypilot,
     load_worker_env,
-    main,
     resolve_worker_env,
 )
 from synth_setter.pipeline.skypilot_launch import (
@@ -45,18 +38,9 @@ from synth_setter.pipeline.skypilot_launch import (
 )
 from synth_setter.resources import configs_dir
 
-
-@pytest.fixture()
-def fake_plugin(tmp_path: Path) -> Path:
-    """Build a minimal VST3 bundle with a moduleinfo.json the renderer can read.
-
-    Version pinned to ``1.3.4`` to match ``configs/render/surge_xt.yaml``'s
-    ``renderer_version``, which the surge_simple group inherits.
-    """
-    contents = tmp_path / "FakePlugin.vst3" / "Contents"
-    contents.mkdir(parents=True)
-    (contents / "moduleinfo.json").write_text('{"Version": "1.3.4"}')
-    return tmp_path / "FakePlugin.vst3"
+# Stable-format marker emitted by ``generate_dataset.main`` for the CI workflow
+# grep; the launcher must not print it (a duplicate would confuse the workflow).
+_SPEC_URI_STDOUT_SENTINEL = "::synth-setter-spec-uri::"
 
 
 @pytest.fixture()
@@ -71,12 +55,6 @@ def env_file(tmp_path: Path) -> Path:
         "RCLONE_CONFIG_R2_ENDPOINT=https://acct.r2.cloudflarestorage.com\n"
     )
     return path
-
-
-@pytest.fixture()
-def template_yaml() -> Path:
-    """Resolve the in-repo SkyPilot RunPod template path."""
-    return Path(str(configs_dir() / "compute" / "runpod-template.yaml"))
 
 
 @pytest.fixture(autouse=True)
@@ -383,518 +361,6 @@ class TestLocalTemplatePodConfig:
         assert containers == [{"imagePullPolicy": "Never"}]
 
 
-class TestEmitSpecUri:
-    """``_emit_spec_uri`` prints the canonical URI on a stdout sentinel line.
-
-    The test-dataset-generation workflow greps the tee'd launcher log for this
-    sentinel (replacing the previous host-side ``synth-setter-spec-uri`` re-
-    invocation in bash, PR #1164).
-    """
-
-    def test_marker_format_is_stable(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """One-line ``::synth-setter-spec-uri::<uri>`` marker so the workflow grep is unambiguous.
-
-        :param capsys: Pytest fixture capturing stdout/stderr.
-        """
-        _emit_spec_uri("r2://intermediate-data/run/input_spec.json")
-        captured = capsys.readouterr()
-        assert (
-            captured.out.strip()
-            == f"{_SPEC_URI_STDOUT_SENTINEL}r2://intermediate-data/run/input_spec.json"
-        )
-
-
-# ---------------------------------------------------------------------------
-# main — new click CLI (subprocess passthrough + spec discovery + dispatch)
-# ---------------------------------------------------------------------------
-
-
-def _build_spec(fake_plugin: Path) -> DatasetSpec:
-    """Build a DatasetSpec wired to ``fake_plugin`` for dispatch tests.
-
-    :param fake_plugin: Path passed through as ``render.plugin_path``.
-    :return: A ``DatasetSpec`` ready for dispatch-path tests.
-    """
-    return DatasetSpec(
-        task_name="test-dispatch",
-        train_val_test_sizes=(10000, 0, 0),
-        output_format="hdf5",
-        base_seed=42,
-        r2={"bucket": "intermediate-data"},  # type: ignore[arg-type]
-        render={  # type: ignore[arg-type]
-            "plugin_path": str(fake_plugin),
-            "preset_path": "presets/surge-base.vstpreset",
-            "param_spec_name": "surge_simple",
-            "renderer_version": "1.3.4",
-            "sample_rate": 16000,
-            "channels": 2,
-            "velocity": 100,
-            "signal_duration_seconds": 4.0,
-            "min_loudness": -55.0,
-            "samples_per_render_batch": 32,
-            "samples_per_shard": 10000,
-        },
-    )
-
-
-def _write_local_spec(cwd: Path, spec: DatasetSpec) -> Path:
-    """Materialize ``spec`` at the canonical ``cwd/data/<task>/<run>/metadata/input_spec.json``.
-
-    Mirrors what the inner ``synth-setter-generate-dataset`` command produces
-    via ``spec_io.write_spec_locally``.
-
-    :param cwd: Working directory under which ``data/`` is created.
-    :param spec: DatasetSpec to materialize on disk.
-    :returns: Path the spec was written to.
-    """
-    target = cwd / "data" / spec.task_name / spec.run_id / "metadata" / "input_spec.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(spec.model_dump_json(indent=2), encoding="utf-8")
-    return target
-
-
-@pytest.fixture()
-def cwd_with_spec(
-    tmp_path: Path,
-    fake_plugin: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Path, Path, DatasetSpec]:
-    """Tmp dir pre-seeded with a canonical input_spec.json and a redirected discovery anchor.
-
-    The launcher reads from ``_LOCAL_DATA_DIR`` (anchored at ``REPO_ROOT/data``).
-    Tests monkeypatch that anchor to ``tmp_path/data`` so each test is hermetic.
-
-    :param tmp_path: Pytest fixture providing a fresh test directory.
-    :param fake_plugin: Fixture-provided fake VST3 plugin path.
-    :param monkeypatch: Pytest fixture for env/attribute mocking.
-    :returns: Tuple of ``(cwd, spec_path, spec)``.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("synth_setter.pipeline.skypilot_launch._LOCAL_DATA_DIR", tmp_path / "data")
-    spec = _build_spec(fake_plugin)
-    spec_path = _write_local_spec(tmp_path, spec)
-    return tmp_path, spec_path, spec
-
-
-class TestCli:
-    """End-to-end CLI behavior on the new ``main(command, ...)`` signature.
-
-    The CLI is a thin orchestrator: run the inner command, find the spec it
-    just wrote, parse it once, and dispatch with ``spec.r2.input_spec_uri()``
-    as ``WORKER_SPEC_URI``.
-    """
-
-    def test_requires_inner_command(
-        self, env_file: Path, template_yaml: Path, mock_sky: MagicMock
-    ) -> None:
-        """No trailing command argument → click usage error before any subprocess call.
-
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            ["--template", str(template_yaml), "--env-file", str(env_file)],
-        )
-        assert result.exit_code != 0
-        mock_sky.jobs.launch.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "inner",
-        [
-            ["synth-setter-generate-dataset", "experiment=foo"],
-            ["/venv/main/bin/synth-setter-generate-dataset", "experiment=foo"],
-            ["python", "-m", "synth_setter.cli.generate_dataset", "experiment=foo"],
-            ["python3", "-m", "synth_setter.cli.generate_dataset", "experiment=foo"],
-        ],
-        ids=[
-            "bare-console-script",
-            "absolute-path-to-console-script",
-            "python -m module",
-            "python3 -m module",
-        ],
-    )
-    def test_rejects_dispatch_owning_inner_command(
-        self,
-        inner: list[str],
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-    ) -> None:
-        """Reject ``synth-setter-generate-dataset`` (and its python -m form) before subprocess.
-
-        The launcher's verbatim worker re-execution would otherwise either
-        re-materialize a fresh spec on each worker or attempt to dispatch a
-        second time. Catching the misuse at the CLI surface is cheaper than
-        debugging it from a failed managed-job run.
-
-        :param inner: Parametrized inner-command argv covering bare console
-            script, absolute-path console script, and ``python(3) -m`` forms.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Used to pin ``subprocess.check_call`` so an
-            accidental fall-through to subprocess execution would be visible
-            as a test failure rather than running the real entrypoint.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        check_call_calls: list[list[str]] = []
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            lambda args, **_kwargs: (check_call_calls.append(list(args)), 0)[1],
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                *inner,
-            ],
-        )
-
-        assert result.exit_code != 0
-        assert "synth-setter-generate-dataset" in result.output
-        assert "skypilot_launch.compute_template" in result.output
-        assert check_call_calls == []
-        mock_sky.jobs.launch.assert_not_called()
-
-    def test_allows_non_dispatch_owning_inner_command(
-        self,
-        cwd_with_spec: tuple[Path, Path, DatasetSpec],
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-    ) -> None:
-        """A ``synth-setter-*`` entry point that does NOT own dispatch is accepted.
-
-        ``synth-setter-spec-uri`` is a read-only console script (it emits the
-        canonical R2 URI for an input_spec and does not call
-        ``dispatch_via_skypilot``), so it must pass the guardrail. This pins
-        the guardrail to the actual ``_DISPATCH_OWNING_ENTRYPOINTS`` set
-        rather than the broader ``synth-setter-*`` prefix.
-
-        :param cwd_with_spec: Fixture providing a CWD pre-populated with a
-            canonical input_spec.json.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        check_call_calls: list[list[str]] = []
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            lambda args, **_kwargs: (check_call_calls.append(list(args)), 0)[1],
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "synth-setter-spec-uri",
-                "some-arg",
-            ],
-        )
-
-        assert result.exit_code == 0, result.output
-        assert check_call_calls == [["synth-setter-spec-uri", "some-arg"]]
-
-    def test_runs_inner_command_via_subprocess(
-        self,
-        cwd_with_spec: tuple[Path, Path, DatasetSpec],
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-    ) -> None:
-        """The CLI delegates spec materialization to a subprocess.check_call of ``command``.
-
-        :param cwd_with_spec: Fixture providing a CWD pre-populated with a canonical input_spec.json.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        # The cwd_with_spec fixture pre-materializes the spec so a no-op check_call
-        # leaves the discovery path satisfied; the assertion is purely about which
-        # argv the launcher forwarded.
-        check_call_calls: list[list[str]] = []
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            lambda args, **_kwargs: (check_call_calls.append(list(args)), 0)[1],
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "materialize-input-spec",
-                "experiment=foo",
-            ],
-        )
-        assert result.exit_code == 0, result.output
-        assert check_call_calls == [["materialize-input-spec", "experiment=foo"]]
-
-    def test_spec_uri_is_threaded_into_worker_env(
-        self,
-        cwd_with_spec: tuple[Path, Path, DatasetSpec],
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-    ) -> None:
-        """``spec.r2.input_spec_uri()`` of the discovered spec lands in the worker's env.
-
-        :param cwd_with_spec: Fixture providing a CWD pre-populated with a canonical input_spec.json.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        _, _, spec = cwd_with_spec
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            lambda _args, **_kwargs: 0,
-        )
-        expected_uri = spec.r2.input_spec_uri()
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "materialize-input-spec",
-            ],
-        )
-        assert result.exit_code == 0, result.output
-        update_envs = mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list
-        assert update_envs, "dispatch_via_skypilot should have updated worker env"
-        forwarded = update_envs[0].args[0]
-        assert forwarded[WORKER_SPEC_URI_ENV] == expected_uri
-
-    def test_no_spec_under_data_dir_fails_clearly(
-        self,
-        tmp_path: Path,
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-    ) -> None:
-        """No spec under data/ → fail loudly rather than dispatch a broken job.
-
-        :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch._LOCAL_DATA_DIR", tmp_path / "data"
-        )
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            lambda _args, **_kwargs: 0,
-        )
-        # No check_output stub — we expect to fail before reaching it.
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "materialize-input-spec",
-            ],
-        )
-        assert result.exit_code != 0
-        assert "no input_spec.json" in result.output
-        mock_sky.jobs.launch.assert_not_called()
-
-    def test_multiple_specs_under_data_dir_fails_clearly(
-        self,
-        cwd_with_spec: tuple[Path, Path, DatasetSpec],
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-        fake_plugin: Path,
-    ) -> None:
-        """Multiple stale runs in ``data/`` is ambiguous → fail loudly.
-
-        :param cwd_with_spec: Fixture providing a CWD pre-populated with a canonical input_spec.json.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
-        """
-        cwd, _, _ = cwd_with_spec
-        # Add a second spec under a different task/run.
-        second = cwd / "data" / "second-task" / "second-run" / "metadata" / "input_spec.json"
-        second.parent.mkdir(parents=True)
-        second.write_text(_build_spec(fake_plugin).model_dump_json())
-
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            lambda _args, **_kwargs: 0,
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "materialize-input-spec",
-            ],
-        )
-        assert result.exit_code != 0
-        assert "expected exactly one" in result.output
-        mock_sky.jobs.launch.assert_not_called()
-
-    def test_inner_command_failure_propagates(
-        self,
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-    ) -> None:
-        """Inner subprocess non-zero rc → CalledProcessError propagates; no dispatch.
-
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        import subprocess as _subprocess
-
-        def _raising(args: list[str], **_kwargs: Any) -> int:
-            raise _subprocess.CalledProcessError(returncode=2, cmd=args)
-
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            _raising,
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "materialize-input-spec",
-            ],
-        )
-        assert result.exit_code != 0
-        mock_sky.jobs.launch.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "raise_type",
-        [ValueError, RuntimeError],
-    )
-    def test_dispatch_error_surfaces_as_click_exception(
-        self,
-        cwd_with_spec: tuple[Path, Path, DatasetSpec],
-        env_file: Path,
-        template_yaml: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_sky: MagicMock,
-        raise_type: type[Exception],
-    ) -> None:
-        """Surface ``dispatch_via_skypilot`` errors as a clean ``click.ClickException``.
-
-        ``dispatch_via_skypilot`` raises ``ValueError`` for cfg-shape errors and ``RuntimeError`` for
-        worker submission failures. Both should reach the operator as a one-line ``click.ClickException``
-        rather than as an uncaught traceback.
-
-        :param cwd_with_spec: Fixture providing a CWD pre-populated with a canonical input_spec.json.
-        :param env_file: Fixture-provided worker env file path.
-        :param template_yaml: Fixture-provided compute template path.
-        :param monkeypatch: Pytest fixture for env/attribute mocking.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        :param raise_type: Parametrized exception class to simulate from dispatch.
-        """
-
-        def _no_op(*_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.subprocess.check_call",
-            _no_op,
-        )
-
-        def _raising_dispatch(*_args: Any, **_kwargs: Any) -> None:
-            raise raise_type("simulated dispatch failure")
-
-        monkeypatch.setattr(
-            "synth_setter.pipeline.skypilot_launch.dispatch_via_skypilot",
-            _raising_dispatch,
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--template",
-                str(template_yaml),
-                "--env-file",
-                str(env_file),
-                "--",
-                "materialize-input-spec",
-            ],
-        )
-
-        assert result.exit_code != 0
-        assert isinstance(result.exception, SystemExit), (
-            f"expected SystemExit (ClickException) but got "
-            f"{type(result.exception).__name__ if result.exception else 'None'}"
-        )
-        assert "simulated dispatch failure" in result.output
-
-    def test_drops_old_experiment_and_hydra_override_surface(self) -> None:
-        """The breaking-change PR drops ``--experiment``, ``--spec-out``, ``--job-name`` flags.
-
-        Callers must rewrite to the new positional-command form. Pinning the option surface here
-        protects against accidental re-introduction.
-        """
-        # Click stores recognized options on ``main.params``.
-        option_flags = {decl for param in main.params for decl in getattr(param, "opts", ())}
-        for dropped in ("--experiment", "--spec-out", "--job-name", "--cluster-name"):
-            assert dropped not in option_flags, (
-                f"{dropped} must not be a recognized launcher option after PR-5"
-            )
-
-
 # ---------------------------------------------------------------------------
 # _override_image_id — per-backend image_id mutation
 # ---------------------------------------------------------------------------
@@ -1170,10 +636,6 @@ def _write_runpod_yaml(
     return path
 
 
-# Sentinel spec URI passed as the dispatch kwarg in tests.
-_DISPATCH_SPEC_URI = "r2://intermediate-data/data/run/input_spec.json"
-
-
 class TestLoadComputeTemplateWithCmd:
     """``_load_compute_template_with_cmd`` injects cmd as run and rejects pre-existing runs."""
 
@@ -1305,71 +767,59 @@ class TestWorkerSpecUriEnvConstant:
 class TestDispatchViaSkypilot:
     """``dispatch_via_skypilot`` rejects degenerate cfgs and threads per-rank fanout through."""
 
-    def test_missing_compute_template_raises(self, fake_plugin: Path) -> None:
-        """``compute_template=None`` is the "don't dispatch" sentinel — calling here is a bug.
-
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
-        """
-        spec = _build_spec(fake_plugin)
+    def test_missing_compute_template_raises(self) -> None:
+        """``compute_template=None`` is the "don't dispatch" sentinel — calling here is a bug."""
         sky_cfg = SkypilotLaunchConfig(compute_template=None, cmd="echo")
         with pytest.raises(ValueError, match="compute_template"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
 
-    def test_missing_cmd_raises(self, tmp_path: Path, fake_plugin: Path) -> None:
+    def test_missing_cmd_raises(self, tmp_path: Path) -> None:
         """No cmd → no run block on the worker → we refuse to launch a no-op task.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(compute_template=str(template), cmd=None)
         with pytest.raises(ValueError, match="cmd"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
 
     def test_yaml_run_block_conflicts_with_cmd(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         mock_sky: MagicMock,
     ) -> None:
         """End-to-end conflict guard: YAML run + sky_cfg.cmd raises before any SkyPilot side effect.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         template = _write_runpod_yaml(tmp_path, include_run=True)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(compute_template=str(template), cmd="echo")
         with pytest.raises(ValueError, match="has a non-empty `run:` block"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
         mock_sky.jobs.launch.assert_not_called()
 
     def test_missing_worker_env_raises(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """No rclone creds in env → fail loudly rather than launching a task that can't upload.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param monkeypatch: Pytest fixture for env/attribute mocking.
         """
         for key in _SECRET_WORKER_ENV_KEYS:
             monkeypatch.delenv(key, raising=False)
 
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
             cmd="exec synth-setter-generate-dataset-from-hydra experiment=foo",
             env_file=None,
         )
         with pytest.raises(ValueError, match="No worker env vars resolved"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
 
     @pytest.mark.parametrize(
         "kwargs_overrides, match",
@@ -1393,7 +843,6 @@ class TestDispatchViaSkypilot:
     def test_phase1_failures_skip_phase2_side_effects(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         monkeypatch: pytest.MonkeyPatch,
         mock_sky: MagicMock,
@@ -1403,15 +852,13 @@ class TestDispatchViaSkypilot:
     ) -> None:
         """Phase-1 raises leave every Phase-2 side effect untouched.
 
-        Probes all four Phase-2 mutations: ``~/.sky/config.yaml`` write,
-        ``_SKYPILOT_API_SERVER_ENV`` set in process env, ``sky.jobs.launch``
-        called, and the ``::synth-setter-spec-uri::`` stdout sentinel. A
-        regression that promotes any one of them above the cred check or
-        any other Phase-1 validator trips this test on every parametrized
-        failure mode.
+        Probes the three Phase-2 mutations: ``~/.sky/config.yaml`` write,
+        ``_SKYPILOT_API_SERVER_ENV`` set in process env, and ``sky.jobs.launch``
+        called. The ``::synth-setter-spec-uri::`` stdout sentinel is owned by
+        ``generate_dataset.main`` — its absence here is a regression guard
+        against re-introducing emission in the launcher.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param monkeypatch: Pytest fixture for env/attribute mocking.
         :param mock_sky: Mocked ``sky`` module from fixture.
@@ -1429,7 +876,6 @@ class TestDispatchViaSkypilot:
         monkeypatch.delenv(_SKYPILOT_API_SERVER_ENV, raising=False)
 
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         kwargs: dict[str, object] = {
             "compute_template": str(template),
             "cmd": "echo",
@@ -1440,31 +886,27 @@ class TestDispatchViaSkypilot:
         sky_cfg = SkypilotLaunchConfig(**kwargs)  # type: ignore[arg-type]
 
         with pytest.raises(ValueError, match=match):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
 
         assert not (tmp_path / ".sky").exists()
         assert _SKYPILOT_API_SERVER_ENV not in os.environ
         mock_sky.jobs.launch.assert_not_called()
         assert _SPEC_URI_STDOUT_SENTINEL not in capsys.readouterr().out
 
-    def test_sentinel_does_not_emit_when_cred_bootstrap_raises(
+    def test_cred_bootstrap_raise_skips_launch_and_stays_silent(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         monkeypatch: pytest.MonkeyPatch,
         mock_sky: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A ``_run_cred_bootstrap`` raise must skip the sentinel + ``sky.jobs.launch``.
+        """A ``_run_cred_bootstrap`` raise propagates without reaching ``sky.jobs.launch``.
 
-        Pins the Phase-2 ordering invariant ``_emit_spec_uri`` runs *after*
-        ``_run_cred_bootstrap`` so a CI workflow that greps the sentinel out of
-        the launcher log can treat it as proof the cred bootstrap succeeded —
-        not just that Phase-1 cleared.
+        The launcher is also silent on the spec-uri sentinel regardless of
+        outcome (the sentinel is owned by ``generate_dataset.main``).
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param monkeypatch: Pytest fixture for env/attribute mocking.
         :param mock_sky: Mocked ``sky`` module from fixture.
@@ -1476,7 +918,6 @@ class TestDispatchViaSkypilot:
         )
 
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
             cmd="echo",
@@ -1485,7 +926,7 @@ class TestDispatchViaSkypilot:
         )
 
         with pytest.raises(RuntimeError, match="simulated bootstrap failure"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
 
         assert _SPEC_URI_STDOUT_SENTINEL not in capsys.readouterr().out
         mock_sky.jobs.launch.assert_not_called()
@@ -1493,19 +934,16 @@ class TestDispatchViaSkypilot:
     def test_end_to_end_dispatch_uses_cmd_as_run_block(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
     ) -> None:
         """Happy-path dispatch: sky.Task.from_yaml_config receives a doc whose ``run`` is sky_cfg.cmd.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         cmd = "exec synth-setter-generate-dataset-from-hydra experiment=foo"
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
@@ -1514,7 +952,7 @@ class TestDispatchViaSkypilot:
             job_name="dispatch-smoke",
         )
 
-        dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+        dispatch_via_skypilot(sky_cfg)
 
         mock_sky.Task.from_yaml_config.assert_called()
         passed_doc = mock_sky.Task.from_yaml_config.call_args.args[0]
@@ -1523,21 +961,18 @@ class TestDispatchViaSkypilot:
     def test_dispatch_failure_raises_runtime_error(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
     ) -> None:
         """A non-success tail rc surfaces as a RuntimeError naming the failed rank.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         mock_sky.stream_and_get.side_effect = RuntimeError("boom")
 
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
             cmd="echo",
@@ -1546,24 +981,21 @@ class TestDispatchViaSkypilot:
         )
 
         with pytest.raises(RuntimeError, match="worker.* failed"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
 
     def test_multi_worker_fans_out_one_task_per_rank(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
     ) -> None:
         """``num_workers=N`` builds N tasks with -rN job-name suffixes, per the fan-out contract.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
             cmd="echo",
@@ -1572,7 +1004,7 @@ class TestDispatchViaSkypilot:
             num_workers=3,
         )
 
-        dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+        dispatch_via_skypilot(sky_cfg)
 
         assert mock_sky.Task.from_yaml_config.call_count == 3
         submitted_names = sorted(
@@ -1587,10 +1019,162 @@ class TestDispatchViaSkypilot:
         for call in mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list:
             assert call.args[0][NUM_WORKERS_ENV_VAR] == "3"
 
+    def test_extra_envs_forwarded_to_each_rank(
+        self,
+        tmp_path: Path,
+        env_file: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """Caller-supplied ``sky_cfg.extra_envs`` lands in every rank's worker env.
+
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param env_file: Fixture-provided worker env file path.
+        :param mock_sky: Mocked ``sky`` module from fixture.
+        """
+        template = _write_runpod_yaml(tmp_path)
+        sky_cfg = SkypilotLaunchConfig(
+            compute_template=str(template),
+            cmd="echo",
+            env_file=str(env_file),
+            job_name="extra-envs",
+            num_workers=2,
+            extra_envs={"FOO": "bar"},
+        )
+
+        dispatch_via_skypilot(sky_cfg)
+
+        update_envs_calls = mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list
+        assert len(update_envs_calls) == 2
+        ranks_seen = sorted(call.args[0][WORKER_RANK_ENV_VAR] for call in update_envs_calls)
+        assert ranks_seen == ["0", "1"]
+        for call in update_envs_calls:
+            injected = call.args[0]
+            assert injected["FOO"] == "bar"
+            assert injected[NUM_WORKERS_ENV_VAR] == "2"
+
+    def test_rank_world_envs_override_caller_extra_envs(
+        self,
+        tmp_path: Path,
+        env_file: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """Launcher-owned rank/world keys win over collisions in ``sky_cfg.extra_envs``.
+
+        Pins the schema's documented precedence rule: a caller smuggling a
+        bogus ``SYNTH_SETTER_WORKER_RANK`` cannot corrupt partitioning.
+
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param env_file: Fixture-provided worker env file path.
+        :param mock_sky: Mocked ``sky`` module from fixture.
+        """
+        template = _write_runpod_yaml(tmp_path)
+        sky_cfg = SkypilotLaunchConfig(
+            compute_template=str(template),
+            cmd="echo",
+            env_file=str(env_file),
+            job_name="rank-precedence",
+            num_workers=2,
+            extra_envs={WORKER_RANK_ENV_VAR: "999", NUM_WORKERS_ENV_VAR: "999"},
+        )
+
+        dispatch_via_skypilot(sky_cfg)
+
+        update_envs_calls = mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list
+        ranks_seen = sorted(call.args[0][WORKER_RANK_ENV_VAR] for call in update_envs_calls)
+        assert ranks_seen == ["0", "1"]
+        for call in update_envs_calls:
+            assert call.args[0][NUM_WORKERS_ENV_VAR] == "2"
+
+    def test_extra_envs_collision_with_resolved_env_keys_raises(
+        self,
+        tmp_path: Path,
+        env_file: Path,
+    ) -> None:
+        """Reject ``extra_envs`` keys that overlap ``_WORKER_ENV_KEYS``.
+
+        Prevents a caller from silently bypassing ``resolve_worker_env``'s
+        ``.env``-then-process-env resolution for secrets.
+
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param env_file: Fixture-provided worker env file path.
+        """
+        template = _write_runpod_yaml(tmp_path)
+        sky_cfg = SkypilotLaunchConfig(
+            compute_template=str(template),
+            cmd="echo",
+            env_file=str(env_file),
+            job_name="cred-overlap",
+            extra_envs={"RCLONE_CONFIG_R2_ACCESS_KEY_ID": "bypass"},
+        )
+
+        with pytest.raises(ValueError, match="extra_envs keys collide"):
+            dispatch_via_skypilot(sky_cfg)
+
+    def test_launcher_does_not_emit_worker_spec_uri_without_extra_envs(
+        self,
+        tmp_path: Path,
+        env_file: Path,
+        mock_sky: MagicMock,
+    ) -> None:
+        """Empty ``extra_envs`` → no rank receives ``WORKER_SPEC_URI`` from the launcher.
+
+        Spec-URI emission moved to the caller (``generate_dataset.main``);
+        the launcher is now spec-agnostic.
+
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param env_file: Fixture-provided worker env file path.
+        :param mock_sky: Mocked ``sky`` module from fixture.
+        """
+        template = _write_runpod_yaml(tmp_path)
+        sky_cfg = SkypilotLaunchConfig(
+            compute_template=str(template),
+            cmd="echo",
+            env_file=str(env_file),
+            job_name="no-spec-uri",
+            num_workers=2,
+            extra_envs={},
+        )
+
+        dispatch_via_skypilot(sky_cfg)
+
+        update_envs_calls = mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list
+        assert len(update_envs_calls) == 2
+        for call in update_envs_calls:
+            assert WORKER_SPEC_URI_ENV not in call.args[0]
+
+    def test_launcher_does_not_print_spec_uri_sentinel(
+        self,
+        tmp_path: Path,
+        env_file: Path,
+        mock_sky: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``dispatch_via_skypilot`` no longer prints the ``::synth-setter-spec-uri::`` marker.
+
+        The CI workflow grep contract now consumes the sentinel from
+        ``generate_dataset.main``'s stdout; the launcher must stay silent so
+        the marker has a single owner.
+
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param env_file: Fixture-provided worker env file path.
+        :param mock_sky: Mocked ``sky`` module from fixture.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        template = _write_runpod_yaml(tmp_path)
+        sky_cfg = SkypilotLaunchConfig(
+            compute_template=str(template),
+            cmd="echo",
+            env_file=str(env_file),
+            job_name="no-sentinel",
+        )
+
+        dispatch_via_skypilot(sky_cfg)
+
+        assert "::synth-setter-spec-uri::" not in capsys.readouterr().out
+
     def test_single_worker_dispatch_still_injects_rank_world_env(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
     ) -> None:
@@ -1603,12 +1187,10 @@ class TestDispatchViaSkypilot:
         duplicate every shard across every node (#763).
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
             cmd="echo",
@@ -1616,7 +1198,7 @@ class TestDispatchViaSkypilot:
             job_name="single-worker-env",
         )
 
-        dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+        dispatch_via_skypilot(sky_cfg)
 
         update_envs_calls = mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list
         assert len(update_envs_calls) == 1
@@ -1635,7 +1217,6 @@ class TestDispatchViaSkypilot:
     def test_input_validation_raises_before_disk_or_network(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
         field: str,
@@ -1645,7 +1226,6 @@ class TestDispatchViaSkypilot:
         """Malformed launcher params surface as ValueError before any SkyPilot submission.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         :param field: Parametrized launcher-config field under test.
@@ -1653,7 +1233,6 @@ class TestDispatchViaSkypilot:
         :param match: Parametrized regex expected in the raised error.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         kwargs: dict[str, object] = {
             "compute_template": str(template),
             "cmd": "echo",
@@ -1664,54 +1243,22 @@ class TestDispatchViaSkypilot:
         sky_cfg = SkypilotLaunchConfig(**kwargs)  # type: ignore[arg-type]
 
         with pytest.raises(ValueError, match=match):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
         mock_sky.jobs.launch.assert_not_called()
-
-    def test_job_name_falls_back_to_task_name_prefix_when_unset(
-        self,
-        tmp_path: Path,
-        fake_plugin: Path,
-        env_file: Path,
-        mock_sky: MagicMock,
-    ) -> None:
-        """job_name=None derives the synth-setter-smoke-<task_name[:8]> fallback.
-
-        :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
-        :param env_file: Fixture-provided worker env file path.
-        :param mock_sky: Mocked ``sky`` module from fixture.
-        """
-        template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
-        sky_cfg = SkypilotLaunchConfig(
-            compute_template=str(template),
-            cmd="echo",
-            env_file=str(env_file),
-            job_name=None,
-        )
-
-        dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
-
-        submitted = mock_sky.jobs.launch.call_args.kwargs["name"]
-        assert submitted.startswith("synth-setter-smoke-")
-        assert submitted.endswith(spec.task_name[:8])
 
     def test_api_server_and_local_are_mutually_exclusive(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
     ) -> None:
         """Setting both api_server and local raises before any launch — opposite dispatch modes.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
             cmd="echo",
@@ -1720,35 +1267,35 @@ class TestDispatchViaSkypilot:
             local=True,
         )
         with pytest.raises(ValueError, match="mutually exclusive"):
-            dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+            dispatch_via_skypilot(sky_cfg)
         mock_sky.jobs.launch.assert_not_called()
 
-    def test_spec_uri_kwarg_injected_verbatim_into_worker_env(
+    def test_job_name_falls_back_to_uuid8_stem_when_unset(
         self,
         tmp_path: Path,
-        fake_plugin: Path,
         env_file: Path,
         mock_sky: MagicMock,
     ) -> None:
-        """The kwarg-supplied ``spec_uri`` lands in worker env verbatim.
+        """``job_name=None`` falls back to ``synth-setter-<uuid8>``.
+
+        Pins the domain-neutral fallback: a caller that doesn't pin a stem gets
+        an 8-hex-char uuid suffix, not a dataset-flavored name.
 
         :param tmp_path: Pytest fixture providing a fresh test directory.
-        :param fake_plugin: Fixture-provided fake VST3 plugin path.
         :param env_file: Fixture-provided worker env file path.
         :param mock_sky: Mocked ``sky`` module from fixture.
         """
         template = _write_runpod_yaml(tmp_path)
-        spec = _build_spec(fake_plugin)
         sky_cfg = SkypilotLaunchConfig(
             compute_template=str(template),
-            cmd="echo",
+            cmd="echo hi",
             env_file=str(env_file),
-            job_name="kwarg-spec-uri",
+            job_name=None,
+            extra_envs={},
         )
 
-        dispatch_via_skypilot(spec, sky_cfg, spec_uri=_DISPATCH_SPEC_URI)
+        dispatch_via_skypilot(sky_cfg)
 
-        update_envs_calls = mock_sky.Task.from_yaml_config.return_value.update_envs.call_args_list
-        assert len(update_envs_calls) == 1
-        forwarded = update_envs_calls[0].args[0]
-        assert forwarded[WORKER_SPEC_URI_ENV] == _DISPATCH_SPEC_URI
+        mock_sky.jobs.launch.assert_called_once()
+        submitted = mock_sky.jobs.launch.call_args.kwargs["name"]
+        assert re.fullmatch(r"synth-setter-[0-9a-f]{8}", submitted), submitted

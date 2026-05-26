@@ -24,18 +24,18 @@ The reconciliation-based pipeline design is naturally compatible with SkyPilot m
 
 ## 2. Architecture Decisions
 
-| Decision          | Choice                                                    | Rationale                                                                                                                                |
-| ----------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Integration depth | Full managed jobs                                         | Spot recovery + R2 markers as natural checkpoints. Cost savings 3-5x on interruptible instances                                          |
-| Local dev/test    | Keep LocalBackend                                         | In-process execution for fast unit tests. Two code paths (local vs SkyPilot)                                                             |
-| Field name        | `compute_config` *(proposed)*                             | Tool-agnostic. Value is the resolved SkyPilot YAML *content* (embedded dict — see §3.1). Survives tool changes without schema migration  |
-| Backend selection | Presence of `compute_config` *(proposed)*                 | `None` → local, dict → SkyPilot. No enum, no protocol, no extra plumbing                                                                 |
-| Shard parallelism | `--num-workers` CLI flag on the launcher                  | Worker count is a launcher concern, not a `DatasetSpec` field; parallelism is recoverable from the per-job spec upload                   |
-| Worker identity   | UUID generated at worker start                            | Decoupled from any provider. Fully portable                                                                                              |
-| Deployment        | Docker image                                              | Reproducible; aligns with `src/synth_setter/pipeline/schemas/image_config.py` (see `docs/reference/docker.md`). SkyPilot pulls the image |
-| CLI ownership     | `python -m synth_setter.pipeline generate` wraps SkyPilot | Single entry point. User never touches `sky` CLI directly for generation                                                                 |
-| Frozen spec       | Include `compute_config` *(proposed)*                     | For provenance and cost tracking                                                                                                         |
-| Scope             | Design all three config types, implement pipeline first   | DatasetSpec, train, eval all get `compute_config` *(proposed)*                                                                           |
+| Decision          | Choice                                                      | Rationale                                                                                                                                |
+| ----------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Integration depth | Full managed jobs                                           | Spot recovery + R2 markers as natural checkpoints. Cost savings 3-5x on interruptible instances                                          |
+| Local dev/test    | Keep LocalBackend                                           | In-process execution for fast unit tests. Two code paths (local vs SkyPilot)                                                             |
+| Field name        | `compute_config` *(proposed)*                               | Tool-agnostic. Value is the resolved SkyPilot YAML *content* (embedded dict — see §3.1). Survives tool changes without schema migration  |
+| Backend selection | Presence of `compute_config` *(proposed)*                   | `None` → local, dict → SkyPilot. No enum, no protocol, no extra plumbing                                                                 |
+| Shard parallelism | `skypilot_launch.num_workers` Hydra field on the entrypoint | Worker count is a launcher concern, not a `DatasetSpec` field; parallelism is recoverable from the per-job spec upload                   |
+| Worker identity   | UUID generated at worker start                              | Decoupled from any provider. Fully portable                                                                                              |
+| Deployment        | Docker image                                                | Reproducible; aligns with `src/synth_setter/pipeline/schemas/image_config.py` (see `docs/reference/docker.md`). SkyPilot pulls the image |
+| CLI ownership     | `python -m synth_setter.pipeline generate` wraps SkyPilot   | Single entry point. User never touches `sky` CLI directly for generation                                                                 |
+| Frozen spec       | Include `compute_config` *(proposed)*                       | For provenance and cost tracking                                                                                                         |
+| Scope             | Design all three config types, implement pipeline first     | DatasetSpec, train, eval all get `compute_config` *(proposed)*                                                                           |
 
 ## 3. Schema Changes
 
@@ -51,7 +51,7 @@ class DatasetSpec(BaseModel):
 
 - `compute_config` defaults to `None` (local execution, backward compatible).
 - Optional field — existing dataset YAMLs continue to construct valid specs.
-- `num_workers` is **not** a spec field — worker count is a launcher concern (see the `--num-workers` CLI flag in [§2 Architecture Decisions](#2-architecture-decisions)) and would conflate launcher provisioning with the reproducibility unit.
+- `num_workers` is **not** a spec field — worker count is a launcher concern (see the `skypilot_launch.num_workers` Hydra field in [§2 Architecture Decisions](#2-architecture-decisions)) and would conflate launcher provisioning with the reproducibility unit.
 
 The SkyPilot YAML content is resolved (read from disk) before the dict reaches `DatasetSpec(**kwargs)` so the frozen spec carries a self-contained snapshot rather than a path; SkyPilot YAMLs are small (~20 lines), so embedding preserves full provenance without bloating the spec.
 
@@ -106,9 +106,9 @@ the same pattern.
 
 The launcher (`synth_setter.pipeline.skypilot_launch`) does not override the `run:` block — it instantiates the Task from YAML and only calls `task.update_envs(...)` to inject the per-launch credential set + the spec URI. The `run:` block in each template handles the worker invocation; per-rank shard scoping is forwarded via `SYNTH_SETTER_WORKER_RANK` / `SYNTH_SETTER_NUM_WORKERS` envs.
 
-#### 4.1.1 Launch mode (`--tail` / `--no-tail`)
+#### 4.1.1 Launch mode (`sky_cfg.tail`)
 
-The launcher accepts `--tail/--no-tail` (default `--no-tail`) — see the Click option in `src/synth_setter/pipeline/skypilot_launch.py` for the live help text and defaults. `--no-tail` waits for `sky.jobs.launch` + `sky.stream_and_get` to return a job_id per rank (the controller has accepted the job), prints `sky jobs logs --name <job_name>` and `sky jobs cancel --name <job_name>` commands the operator can run, and exits without tailing logs and without cancelling successfully-submitted jobs — the controller's terminal-status lifecycle releases the underlying compute on success/fail, so a clean launcher exit doesn't kill in-flight work. Half-submitted jobs (those whose `sky.jobs.launch`/`sky.stream_and_get` raised or yielded no job_id) are still cancelled in `--no-tail` so the controller doesn't accumulate orphan state; sibling jobs that launched cleanly are left running. `--tail` opts into `sky.jobs.tail_logs(follow=True)` and unconditional `finally`-block cancellation of every job; CI lanes that need exit-code-reflects-worker-success-and-uniform-cleanup pass `--tail` explicitly.
+The launcher reads `sky_cfg.tail` (a `SkypilotLaunchConfig` field, default `False`; see `src/synth_setter/pipeline/schemas/skypilot_launch.py`). With `tail=False`, the launcher waits for `sky.jobs.launch` + `sky.stream_and_get` to return a job_id per rank (the controller has accepted the job), prints `sky jobs logs --name <job_name>` and `sky jobs cancel --name <job_name>` commands the operator can run, and exits without tailing logs and without cancelling successfully-submitted jobs — the controller's terminal-status lifecycle releases the underlying compute on success/fail, so a clean launcher exit doesn't kill in-flight work. Half-submitted jobs (those whose `sky.jobs.launch`/`sky.stream_and_get` raised or yielded no job_id) are still cancelled under `tail=False` so the controller doesn't accumulate orphan state; sibling jobs that launched cleanly are left running. `tail=True` opts into `sky.jobs.tail_logs(follow=True)` and unconditional `finally`-block cancellation of every job; CI lanes that need exit-code-reflects-worker-success-and-uniform-cleanup set it explicitly via `skypilot_launch.tail=true`.
 
 ### 4.2 Env-var resolution: launcher → worker
 
@@ -124,7 +124,7 @@ Anything outside the tuple is *not* forwarded to the worker, even if it's set in
 
 For each key in `_WORKER_ENV_KEYS`, the launcher takes the first value it finds:
 
-1. The `.env` file at `--env-file` (default `<repo_root>/.env`), if the file exists and has the key.
+1. The `.env` file at `sky_cfg.env_file` (default `<repo_root>/.env`), if the file exists and has the key.
 2. The launcher's process env (`os.environ`), if the key is set.
 3. Otherwise: skipped — the key keeps the SkyPilot template's default (typically `""`). If the worker actually needs it, rclone fails downstream with an actionable error.
 
@@ -145,57 +145,38 @@ synth-setter-generate-dataset \
     skypilot_launch.compute_template=src/synth_setter/configs/compute/runpod-template.yaml
 ```
 
-This is the **standard** local dispatch path: each `synth-setter-*` CLI
-entrypoint that supports SkyPilot carries its own `skypilot_launch` sub-config
-(today `synth-setter-generate-dataset`; more entrypoints are expected to
-follow), and setting `skypilot_launch.compute_template` flips the same command
-from "run in-process" to "materialize the spec, then dispatch via SkyPilot".
-The env-resolution logic described above lives inside
-`dispatch_via_skypilot` and runs the same way regardless of whether the call
-originated from this standard path or from the ad-hoc launcher CLI
-(`python -m synth_setter.pipeline.skypilot_launch`, contrasted against the
-standard path in
-[configuration-reference.md §2.4](../reference/configuration-reference.md#24-cloud-infrastructure))
-— both share one resolver, one `.env` lookup, and one set of failure modes.
+This is the dispatch path each `synth-setter-*` CLI entrypoint takes: the
+entrypoint carries its own `skypilot_launch` sub-config (today
+`synth-setter-generate-dataset`; more entrypoints are expected to follow),
+and setting `skypilot_launch.compute_template` flips the same command from
+"run in-process" to "materialize the spec, then dispatch via SkyPilot". The
+env-resolution logic described above lives inside `dispatch_via_skypilot`
+and runs the same way for every caller — one resolver, one `.env` lookup,
+one set of failure modes.
 
 The resolver finds `<repo_root>/.env`, parses it via `python-dotenv`, and
 resolves all keys from there. Process env is a non-event because `.env` wins
 per key — useful when you have stale shell exports.
 
-For arbitrary ad-hoc commands that have no `synth-setter-*` entrypoint of
-their own, use the launcher CLI directly:
+#### Caller-supplied worker envs
 
-```bash
-python -m synth_setter.pipeline.skypilot_launch \
-    --template src/synth_setter/configs/compute/runpod-template.yaml \
-    -- <arbitrary-command-that-materializes-an-input_spec.json>
-```
+`dispatch_via_skypilot(sky_cfg)` is domain-neutral: it knows nothing about
+`DatasetSpec` and exposes no spec-aware kwargs. Callers thread their own
+worker envs through `sky_cfg.extra_envs: dict[str, str]`. The launcher
+merges that dict into the per-rank env dict after `resolve_worker_env`, so
+caller values override resolver values; rank/world keys
+(`SYNTH_SETTER_WORKER_RANK`, `SYNTH_SETTER_NUM_WORKERS`) are injected last
+and remain launcher-owned.
 
-The launcher's `--` argument is passed verbatim to `subprocess.check_call` and
-re-used as each worker's `run:` command, so the inner command must be safe to
-re-execute identically on the launcher host and on every worker rank. Do
-**not** pass a `synth-setter-*` CLI entrypoint as the inner command — those
-already own their dispatch via the standard path above, and routing them
-through this launcher would either materialize a fresh spec on each worker
-(losing alignment with the canonical `input_spec.json` the launcher just
-discovered) or attempt to dispatch a second time.
-
-To close the misuse loop, the launcher carries a runtime guardrail —
-`_DISPATCH_OWNING_ENTRYPOINTS` (`src/synth_setter/pipeline/skypilot_launch.py`)
-lists the `synth-setter-*` console scripts that own their own dispatch, and
-passing any of them as the inner command (whether as the bare console-script
-name, an absolute-path invocation, or the `python -m <module>` equivalent)
-raises a `click.ClickException` before the inner subprocess is even spawned.
-The check is intentionally narrow: it catches the direct-invocation misuse
-but does not chase shell aliases or wrapper scripts that resolve to a
-dispatching entrypoint by a different name, so the rule still rides on
-operator discipline at the margins.
-
-> **Note on `python -m synth_setter.pipeline.skypilot_launch -- …`.** The launcher CLI accepts an arbitrary inner command via the trailing `--` separator, but the inner command must (a) materialize exactly one canonical `data/<task>/<run>/metadata/input_spec.json`, (b) upload that spec to its canonical R2 URI (the launcher itself does not upload — it parses the discovered spec once, reads `spec.r2.input_spec_uri()`, and forwards it as `WORKER_SPEC_URI`), and (c) re-enter deterministically on the worker (the same string is threaded into the SkyPilot task's `run:` block via `shlex.join`). The default `synth-setter-generate-dataset` console script does **not** yet satisfy (c) — it re-composes Hydra fresh and would either run the pipeline locally on the worker or recursively dispatch — so it is not currently a valid inner command for this entrypoint. Use the canonical `synth-setter-generate-dataset` path shown above until a materialize-only mode lands (follow-up tracked in #1160).
+The dataset pipeline uses this seam to forward the canonical spec URI:
+`generate_dataset.main` writes
+`sky_cfg.extra_envs["WORKER_SPEC_URI"] = spec.r2.input_spec_uri()` immediately
+before the dispatch call. Future callers fill the same dict with whatever
+envs their worker entrypoint needs.
 
 #### CI story
 
-Source of truth: the GitHub-Actions runner's process env, populated from `secrets.*` and passed into the container via `docker run -e ...`. **No `.env` file is ever written to the runner's filesystem.** The launcher's default `--env-file` path doesn't resolve, the `.env` branch is silently skipped, and resolution falls through to the container's process env.
+Source of truth: the GitHub-Actions runner's process env, populated from `secrets.*` and passed into the container via `docker run -e ...`. **No `.env` file is ever written to the runner's filesystem.** The default `sky_cfg.env_file` path (`<repo_root>/.env`) doesn't resolve, the `.env` branch is silently skipped, and resolution falls through to the container's process env.
 
 The SkyPilot launch step in `.github/workflows/test-dataset-generation.yml` (only fires on `runpod` / `oci` matrix cells; same-repo PRs run a non-SkyPilot `local` cell — see [github-actions.md](../reference/github-actions.md)):
 
@@ -218,7 +199,7 @@ The SkyPilot launch step in `.github/workflows/test-dataset-generation.yml` (onl
       -e RCLONE_CONFIG_R2_ENDPOINT \
       -e R2_ACCOUNT_ID \
       -e WANDB_API_KEY \
-      "$IMAGE" bash -c '... python -m synth_setter.pipeline.skypilot_launch ...'
+      "$IMAGE" bash -c '... synth-setter-generate-dataset ... skypilot_launch.compute_template=... ...'
 ```
 
 Notes:
