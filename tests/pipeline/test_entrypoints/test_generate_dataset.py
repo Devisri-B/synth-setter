@@ -5,12 +5,13 @@ The entrypoint's public surface:
 - ``main()``: launcher-side orchestrator. Composes the cfg, writes the local
   ``input_spec.json`` mirror, runs ``r2_io.ensure_r2_env_loaded`` (dotenv +
   auth ping), uploads the canonical spec via ``spec_io.upload_spec``, then
-  either calls ``generate(spec)`` inline (local-run) or dispatches to a SkyPilot
-  worker pod.
-- ``generate(spec)``: per-rank renderer. For each owned shard in ``spec.shards``,
-  shells out to ``generate_vst_dataset.py``, uploads the shard to R2 at
-  ``r2:{bucket}/{prefix}/``, and unlinks the local file. No longer uploads
-  the spec — ``main()`` does that once on the launcher host.
+  either calls ``generate(spec, work_dir)`` inline (local-run) or dispatches
+  to a SkyPilot worker pod.
+- ``generate(spec, work_dir)``: per-rank renderer. For each owned shard in
+  ``spec.shards``, shells out to ``generate_vst_dataset.py`` writing into
+  ``work_dir``, then uploads the shard to R2 at ``r2:{bucket}/{prefix}/``;
+  rendered shards are retained under ``work_dir`` for downstream consumption.
+  ``main()`` writes the canonical spec to R2 once on the launcher host.
 
 ``TestRun`` tests share a ``patched_subprocess`` fixture that pulls in
 ``fake_r2_remote`` (see ``tests/pipeline/conftest.py``) and patches
@@ -256,14 +257,16 @@ class TestRun:
         self,
         patched_subprocess: MagicMock,
         spec: DatasetSpec,
+        tmp_path: Path,
     ) -> None:
         """subprocess.check_call invokes generate_vst_dataset.py with spec-derived args.
 
         :param patched_subprocess: Subprocess dispatcher used to introspect the
             single renderer call's argv.
         :param spec: Fixture-provided ``DatasetSpec``.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
-        generate(spec)
+        generate(spec, tmp_path)
 
         renderer_calls = _renderer_argv_lists(patched_subprocess)
         assert len(renderer_calls) == 1
@@ -276,6 +279,7 @@ class TestRun:
         self,
         patched_subprocess: MagicMock,
         spec: DatasetSpec,
+        tmp_path: Path,
     ) -> None:
         """Prefix the VST subprocess with ``run-linux-vst-headless.sh`` on Linux.
 
@@ -286,8 +290,9 @@ class TestRun:
         :param patched_subprocess: Subprocess dispatcher used to introspect the
             renderer argv (looking for the headless-wrapper prefix on Linux).
         :param spec: Fixture-provided ``DatasetSpec``.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
-        generate(spec)
+        generate(spec, tmp_path)
 
         renderer_calls = _renderer_argv_lists(patched_subprocess)
         assert len(renderer_calls) == 1
@@ -304,6 +309,7 @@ class TestRun:
         spec: DatasetSpec,
         fake_r2_remote: Path,
         patched_subprocess: MagicMock,  # noqa: ARG002
+        tmp_path: Path,
     ) -> None:
         """Shard lands at the R2 URI implied by ``spec.r2`` and the shard's filename.
 
@@ -318,8 +324,9 @@ class TestRun:
         :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
         :param patched_subprocess: Fixture-activation only (handles the
             ``subprocess.check_call`` patch).
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
-        generate(spec)
+        generate(spec, tmp_path)
 
         landed = fake_r2_remote / spec.r2.bucket / spec.r2.prefix / spec.shards[0].filename
         assert landed.is_file()
@@ -329,6 +336,7 @@ class TestRun:
         patched_subprocess: MagicMock,
         spec: DatasetSpec,
         fake_r2_remote: Path,
+        tmp_path: Path,
     ) -> None:
         """CalledProcessError from generate_vst_dataset propagates to caller.
 
@@ -337,13 +345,14 @@ class TestRun:
         :param spec: Fixture-provided ``DatasetSpec``.
         :param fake_r2_remote: Local-typed rclone remote — asserted empty since
             no shard should land when the renderer fails.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
         patched_subprocess.side_effect = subprocess.CalledProcessError(
             1, "generate_vst_dataset.py"
         )
 
         with pytest.raises(subprocess.CalledProcessError):
-            generate(spec)
+            generate(spec, tmp_path)
 
         # No rclone copy reached the fake remote.
         assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
@@ -353,6 +362,7 @@ class TestRun:
         patched_subprocess: MagicMock,  # noqa: ARG002
         spec: DatasetSpec,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """CalledProcessError from rclone (shard upload path) propagates to caller.
 
@@ -367,11 +377,12 @@ class TestRun:
         :param spec: Fixture-provided ``DatasetSpec``.
         :param monkeypatch: Used to invalidate the ``r2:`` remote type so the
             real rclone subprocess exits non-zero on the copy.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
         monkeypatch.setenv("RCLONE_CONFIG_R2_TYPE", "this-backend-does-not-exist")
 
         with pytest.raises(subprocess.CalledProcessError):
-            generate(spec)
+            generate(spec, tmp_path)
 
     def test_run_with_three_shards_renders_each_shard(
         self,
@@ -389,7 +400,7 @@ class TestRun:
         """
         spec = _multi_shard_spec(tmp_path, n=3)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         renderer_calls = _renderer_argv_lists(patched_subprocess)
         assert len(renderer_calls) == 3
@@ -426,7 +437,7 @@ class TestRun:
             "synth_setter.cli.generate_dataset.subprocess.check_call",
             side_effect=_record_dispatcher,
         ):
-            generate(spec)
+            generate(spec, tmp_path)
 
         assert events == [
             "renderer",  # shard 0
@@ -437,75 +448,32 @@ class TestRun:
             "rclone",
         ]
 
-    def test_local_shard_file_removed_after_upload(
+    def test_shards_persist_after_upload(
         self,
         fake_r2_remote: Path,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Each shard's local HDF5 is unlinked between its upload and the next render.
+        """Every rendered shard remains at ``work_dir / shard.filename`` after upload.
 
-        Verifies the disk-bounding invariant via an interleaved event stream
-        (renderer / rclone / unlink). For every shard the test asserts the
-        per-shard sequence ``(renderer, rclone, unlink)`` on the same path —
-        which proves both ordering (shard N is unlinked *before* shard N+1's
-        renderer runs) and final-shard coverage (the last shard's unlink is
-        recorded, not masked by the outer ``TemporaryDirectory`` teardown).
+        Pins the post-upload retention contract: ``finalize_dataset`` and
+        post-mortem consumers expect shards to outlive the render+upload step.
 
-        :param fake_r2_remote: Local-typed R2 remote rooted at a tmp dir.
-        :param tmp_path: Pytest tmp dir used by ``_multi_shard_spec``.
-        :param monkeypatch: Used to wrap ``Path.unlink`` with a call-recording
-            spy that delegates to the real implementation.
+        :param fake_r2_remote: Local-typed R2 remote — asserted to contain every
+            shard alongside the on-disk copies.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
         spec = _multi_shard_spec(tmp_path, n=3)
-        events: list[tuple[str, Path]] = []
-
-        def _record_dispatcher(args: list[str]) -> int:
-            if args and args[0] == "rclone":
-                # rclone copy argv ends with [src, dest]; the src is the
-                # just-rendered shard's local path.
-                events.append(("rclone", Path(args[-2])))
-                return _REAL_CHECK_CALL(args)
-            out_path = Path(args[find_script_index(args) + 1])
-            events.append(("renderer", out_path))
-            return _materialize_shard(args)
-
-        real_unlink = Path.unlink
-
-        def _spy_unlink(self: Path, missing_ok: bool = False) -> None:
-            events.append(("unlink", self))
-            real_unlink(self, missing_ok=missing_ok)
-
-        monkeypatch.setattr(Path, "unlink", _spy_unlink)
 
         with patch(
             "synth_setter.cli.generate_dataset.subprocess.check_call",
-            side_effect=_record_dispatcher,
+            side_effect=_materialize_or_passthrough_rclone,
         ):
-            generate(spec)
+            generate(spec, tmp_path)
 
-        # Restrict unlink events to those targeting an uploaded shard source —
-        # the spy captures every Path.unlink in-process, but only shard-source
-        # unlinks are part of the disk-bounding contract under test.
-        upload_sources = [p for kind, p in events if kind == "rclone"]
-        shard_paths = set(upload_sources)
-        shard_events = [
-            (kind, p)
-            for kind, p in events
-            if kind in ("renderer", "rclone") or (kind == "unlink" and p in shard_paths)
-        ]
-        expected = [
-            entry
-            for src in upload_sources
-            for entry in (("renderer", src), ("rclone", src), ("unlink", src))
-        ]
-        assert len(upload_sources) == 3
-        assert shard_events == expected, (
-            "per-shard sequence (renderer, rclone, unlink) was not maintained: "
-            f"got {shard_events!r}, expected {expected!r}"
-        )
+        bucket_prefix = fake_r2_remote / spec.r2.bucket / spec.r2.prefix
         for shard in spec.shards:
-            assert (fake_r2_remote / spec.r2.bucket / spec.r2.prefix / shard.filename).is_file()
+            assert (tmp_path / shard.filename).is_file()
+            assert (bucket_prefix / shard.filename).is_file()
 
     def test_subprocess_failure_in_second_shard_propagates_immediately(
         self,
@@ -536,7 +504,7 @@ class TestRun:
             side_effect=_side_effect,
         ):
             with pytest.raises(subprocess.CalledProcessError):
-                generate(spec)
+                generate(spec, tmp_path)
 
         assert renderer_call_count == 2
         # State-based proof of fail-fast: only shard 0 landed in R2.
@@ -549,6 +517,7 @@ class TestRun:
         self,
         fake_r2_remote: Path,
         spec: DatasetSpec,
+        tmp_path: Path,
     ) -> None:
         """If the renderer exits 0 but never wrote the expected shard file, fail loudly.
 
@@ -558,6 +527,7 @@ class TestRun:
         :param fake_r2_remote: Local-typed R2 remote — must remain empty since
             no shard file is written and rclone is therefore never invoked.
         :param spec: Fixture-provided ``DatasetSpec``.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
         # Renderer-only side effect: return 0 without writing the shard file,
         # so the ``shard_path.is_file()`` guard raises before any rclone call.
@@ -566,7 +536,7 @@ class TestRun:
             return_value=0,
         ):
             with pytest.raises(RuntimeError, match="did not write expected shard file"):
-                generate(spec)
+                generate(spec, tmp_path)
 
         assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
 
@@ -589,7 +559,7 @@ class TestRun:
         spec = DatasetSpec(**kwargs)  # type: ignore[arg-type]
 
         with pytest.raises(RuntimeError, match="Renderer version mismatch"):
-            generate(spec)
+            generate(spec, tmp_path)
         patched_subprocess.assert_not_called()
         assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
 
@@ -614,7 +584,7 @@ class TestRun:
         monkeypatch.delenv("SYNTH_SETTER_NUM_WORKERS", raising=False)
         spec = _multi_shard_spec(tmp_path, n=3)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         rendered_filenames = {
             Path(args[find_script_index(args) + 1]).name
@@ -648,7 +618,7 @@ class TestRun:
         spec = _multi_shard_spec(tmp_path, n=3)
 
         with pytest.raises(ValueError) as excinfo:
-            generate(spec)
+            generate(spec, tmp_path)
         message = str(excinfo.value)
         assert "SYNTH_SETTER_WORKER_RANK" in message
         assert "SYNTH_SETTER_NUM_WORKERS" in message
@@ -675,7 +645,7 @@ class TestRun:
         monkeypatch.setenv("SYNTH_SETTER_NUM_WORKERS", "2")
         spec = _multi_shard_spec(tmp_path, n=3)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         rendered_filenames = [
             Path(args[find_script_index(args) + 1]).name
@@ -707,7 +677,7 @@ class TestRun:
         monkeypatch.setenv("SYNTH_SETTER_NUM_WORKERS", "2")
         spec = _multi_shard_spec(tmp_path, n=3)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         rendered_filenames = [
             Path(args[find_script_index(args) + 1]).name
@@ -740,7 +710,7 @@ class TestRun:
         monkeypatch.setenv("SYNTH_SETTER_NUM_WORKERS", "4")
         spec = _multi_shard_spec(tmp_path, n=3)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         patched_subprocess.assert_not_called()
         assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
@@ -753,6 +723,7 @@ class TestRun:
         fake_r2_remote: Path,
         spec: DatasetSpec,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """Object present (size > 0) → renderer is not invoked, shard upload is not attempted.
 
@@ -762,10 +733,11 @@ class TestRun:
         :param spec: Fixture-provided ``DatasetSpec``.
         :param monkeypatch: Used to override the probe to claim the shard is
             already in R2.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", lambda *_a, **_k: 12345)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         patched_subprocess.assert_not_called()
         assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
@@ -775,6 +747,7 @@ class TestRun:
         patched_subprocess: MagicMock,
         fake_r2_remote: Path,
         spec: DatasetSpec,
+        tmp_path: Path,
     ) -> None:
         """Object absent (None) → render proceeds as before.
 
@@ -784,8 +757,9 @@ class TestRun:
             to fire exactly once.
         :param fake_r2_remote: Local-typed R2 remote — shard should land here.
         :param spec: Fixture-provided ``DatasetSpec``.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
-        generate(spec)
+        generate(spec, tmp_path)
 
         renderer_calls = _renderer_argv_lists(patched_subprocess)
         assert len(renderer_calls) == 1
@@ -799,6 +773,7 @@ class TestRun:
         fake_r2_remote: Path,
         spec: DatasetSpec,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """Zero-byte object is treated as absent — defensive against half-uploaded objects.
 
@@ -807,10 +782,11 @@ class TestRun:
         :param fake_r2_remote: Local-typed R2 remote — shard should land here.
         :param spec: Fixture-provided ``DatasetSpec``.
         :param monkeypatch: Used to override the probe to report 0 bytes.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", lambda *_a, **_k: 0)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         renderer_calls = _renderer_argv_lists(patched_subprocess)
         assert len(renderer_calls) == 1
@@ -840,7 +816,7 @@ class TestRun:
 
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", _probe)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         assert probed_uris == [
             f"r2://{spec.r2.bucket}/{spec.r2.prefix}{shard.filename}" for shard in spec.shards
@@ -869,7 +845,7 @@ class TestRun:
 
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", _present_only_for_shard_0)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         rendered_filenames = [
             Path(args[find_script_index(args) + 1]).name
@@ -905,7 +881,7 @@ class TestRun:
 
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", _present_only_for_shard_0)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         info_messages = [str(c.args[0]) for c in mock_logger.info.call_args_list]
         summary_lines = [m for m in info_messages if "rendered=" in m and "skipped=" in m]
@@ -935,7 +911,7 @@ class TestRun:
 
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", _present_only_for_shard_0)
 
-        generate(spec)
+        generate(spec, tmp_path)
 
         info_messages = [str(c.args[0]) for c in mock_logger.info.call_args_list]
         speed_lines = [m for m in info_messages if "generation speed:" in m]
@@ -949,6 +925,7 @@ class TestRun:
         patched_subprocess: MagicMock,
         spec: DatasetSpec,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """A non-zero rclone exit during the probe propagates as CalledProcessError.
 
@@ -956,6 +933,7 @@ class TestRun:
             invoked (the probe failure raises before any render/upload).
         :param spec: Fixture-provided ``DatasetSpec``.
         :param monkeypatch: Used to install the raising probe stub.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
         """
 
         def _raise(*_a: object, **_k: object) -> None:
@@ -964,7 +942,7 @@ class TestRun:
         monkeypatch.setattr("synth_setter.pipeline.r2_io.object_size", _raise)
 
         with pytest.raises(subprocess.CalledProcessError):
-            generate(spec)
+            generate(spec, tmp_path)
 
         patched_subprocess.assert_not_called()
 
@@ -1002,7 +980,7 @@ class TestRun:
             "synth_setter.cli.generate_dataset.subprocess.check_call",
             side_effect=_flaky_dispatcher,
         ):
-            generate(spec)
+            generate(spec, tmp_path)
 
         assert renderer_calls == 2
         landed = fake_r2_remote / spec.r2.bucket / spec.r2.prefix / spec.shards[0].filename
@@ -1050,7 +1028,7 @@ class TestRun:
             "synth_setter.cli.generate_dataset.subprocess.check_call",
             side_effect=_thread_recording_dispatcher,
         ):
-            generate(spec)
+            generate(spec, tmp_path)
 
         assert len(thread_ids) >= 2
         bucket_prefix = fake_r2_remote / spec.r2.bucket / spec.r2.prefix
@@ -1099,7 +1077,7 @@ class TestRun:
             side_effect=_one_failing,
         ):
             with pytest.raises(subprocess.CalledProcessError):
-                generate(spec)
+                generate(spec, tmp_path)
 
         bucket_prefix = fake_r2_remote / spec.r2.bucket / spec.r2.prefix
         landed = sum(1 for shard in spec.shards if (bucket_prefix / shard.filename).is_file())
@@ -1137,10 +1115,44 @@ class TestRun:
             side_effect=_always_fails,
         ):
             with pytest.raises(subprocess.CalledProcessError):
-                generate(spec)
+                generate(spec, tmp_path)
 
         assert renderer_calls == 3
         assert not (fake_r2_remote / spec.r2.bucket / spec.r2.prefix).exists()
+
+    def test_shard_lands_in_work_dir_before_upload(
+        self,
+        patched_subprocess: MagicMock,  # noqa: ARG002
+        spec: DatasetSpec,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Caller-supplied ``work_dir`` hosts the rendered shard at the upload boundary.
+
+        Stubs ``_rclone_copy`` to snapshot the source path and its on-disk
+        existence at the upload moment — proving the shard landed at
+        ``work_dir / shard.filename`` before the upload runs.
+
+        :param patched_subprocess: Fixture-activation only; renderer side of the
+            dispatcher materializes the shard file into ``work_dir``.
+        :param spec: Fixture-provided single-shard ``DatasetSpec``.
+        :param tmp_path: Caller-supplied work_dir for this run.
+        :param monkeypatch: Used to install the rclone-stub that captures the
+            shard path + existence at the upload moment.
+        """
+        captured: dict[str, object] = {}
+
+        def _capture_src(src: str, _dest: str) -> None:
+            src_path = Path(src)
+            captured["src"] = src_path
+            captured["existed_at_upload"] = src_path.is_file()
+
+        monkeypatch.setattr("synth_setter.cli.generate_dataset._rclone_copy", _capture_src)
+
+        generate(spec, tmp_path)
+
+        assert captured["src"] == tmp_path / spec.shards[0].filename
+        assert captured["existed_at_upload"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1350,13 +1362,18 @@ class TestMainDispatchBranches:
     """``main()`` composes the dataset cfg from argv, then dispatches local or via SkyPilot."""
 
     @pytest.fixture(autouse=True)
-    def _set_default_skypilot_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Set single-worker rank/world env so the local branch's generate() succeeds.
+    def _set_default_skypilot_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Pin single-worker rank/world + isolate Hydra's per-run dir to ``tmp_path``.
+
+        ``@hydra.main`` resolves ``${paths.log_dir}`` from ``${oc.env:PROJECT_ROOT}``;
+        redirecting PROJECT_ROOT keeps the per-run dir under the test tree.
 
         :param monkeypatch: Pytest fixture used to set env vars.
+        :param tmp_path: Per-test tmp dir hosting PROJECT_ROOT.
         """
         monkeypatch.setenv("SYNTH_SETTER_WORKER_RANK", "0")
         monkeypatch.setenv("SYNTH_SETTER_NUM_WORKERS", "1")
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
 
     @pytest.fixture(autouse=True)
     def _stub_spec_io_in_main(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1380,7 +1397,7 @@ class TestMainDispatchBranches:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """compute_template=null calls generate(spec) inline; dispatch is not used.
+        """compute_template=null calls generate(spec, work_dir) inline; dispatch is not used.
 
         :param monkeypatch: Pytest fixture used to patch argv and module functions.
         """
@@ -1398,7 +1415,7 @@ class TestMainDispatchBranches:
 
         recorded: dict[str, object] = {}
 
-        def _fake_run(spec: object) -> None:
+        def _fake_run(spec: object, _work_dir: object) -> None:
             recorded["spec"] = spec
 
         def _dispatch_must_not_fire(*_args: object, **_kwargs: object) -> None:
@@ -1471,9 +1488,11 @@ class TestMainDispatchBranches:
 
         Uses Hydra's `+key=value` add-syntax because the key isn't in
         configs/skypilot_launch/default.yaml (struct-mode would otherwise reject it before our
-        guard runs).
+        guard runs). ``HYDRA_FULL_ERROR=1`` makes ``@hydra.main`` re-raise the launcher-side
+        ``ValueError`` instead of converting it to ``SystemExit(1)``, so the assertion pins the
+        launcher contract directly rather than coupling to Hydra's error-handler formatting.
 
-        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param monkeypatch: Pytest fixture used to set ``sys.argv`` and ``HYDRA_FULL_ERROR``.
         """
         import synth_setter.cli.generate_dataset as gd
         import synth_setter.pipeline.skypilot_launch as sl
@@ -1485,6 +1504,7 @@ class TestMainDispatchBranches:
             "+skypilot_launch.cmd=rm -rf /",
         ]
         monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setenv("HYDRA_FULL_ERROR", "1")
 
         def _run_must_not_fire(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("generate must not be called when cmd is rejected")
@@ -1505,18 +1525,23 @@ class TestMainSpecPersistence:
     The R2 upload is launcher-side and happens once per ``main()`` invocation:
     after the local write, before the local-run / dispatch branch is taken.
     Workers in the dispatch path no longer re-upload the spec (the worker's
-    ``generate(spec)`` writes shards only); the canonical R2 object exists before
-    any worker boots.
+    ``generate(spec, work_dir)`` writes shards only); the canonical R2 object
+    exists before any worker boots.
     """
 
     @pytest.fixture(autouse=True)
-    def _set_default_skypilot_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Single-worker rank/world so the local branch's ``generate()`` shim succeeds.
+    def _set_default_skypilot_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Pin single-worker rank/world + isolate Hydra's per-run dir to ``tmp_path``.
+
+        ``@hydra.main`` resolves ``${paths.log_dir}`` from ``${oc.env:PROJECT_ROOT}``;
+        redirecting PROJECT_ROOT keeps the per-run dir under the test tree.
 
         :param monkeypatch: Pytest fixture used to set env vars.
+        :param tmp_path: Per-test tmp dir hosting PROJECT_ROOT.
         """
         monkeypatch.setenv("SYNTH_SETTER_WORKER_RANK", "0")
         monkeypatch.setenv("SYNTH_SETTER_NUM_WORKERS", "1")
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
 
     @pytest.fixture(autouse=True)
     def _stub_run_and_spec_io(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1530,7 +1555,7 @@ class TestMainSpecPersistence:
         """
         import synth_setter.cli.generate_dataset as gd
 
-        monkeypatch.setattr(gd, "generate", lambda _spec: None)
+        monkeypatch.setattr(gd, "generate", lambda _spec, _work_dir: None)
         monkeypatch.setattr(
             gd,
             "write_spec_locally",
@@ -1745,6 +1770,80 @@ class TestMainSpecPersistence:
         sky_cfg = recorded["sky_cfg"]
         spec_call = gd.write_spec_locally.call_args[0][0]  # type: ignore[attr-defined]
         assert sky_cfg.job_name == gd._smoke_job_name(spec_call)  # type: ignore[attr-defined]
+
+
+class TestMainHydraOutputDir:
+    """``cfg.paths.output_dir`` resolves to Hydra's per-run dir inside ``main()``.
+
+    Pins the @hydra.main decoration contract for the launcher entrypoint.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_hydra_output_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Redirect PROJECT_ROOT to tmp so Hydra writes the per-run dir under the test tree.
+
+        :param monkeypatch: Pytest fixture used to override env vars.
+        :param tmp_path: Per-test tmp dir hosting the synthetic checkout root.
+        """
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setenv("SYNTH_SETTER_WORKER_RANK", "0")
+        monkeypatch.setenv("SYNTH_SETTER_NUM_WORKERS", "1")
+
+    @pytest.fixture(autouse=True)
+    def _stub_run_and_spec_io(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stub the launcher's R2 + dispatch surface so main() runs without I/O.
+
+        :param monkeypatch: Pytest fixture used to patch module-level callables.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        monkeypatch.setattr(gd, "generate", lambda _spec, _work_dir: None)
+        monkeypatch.setattr(
+            gd,
+            "write_spec_locally",
+            MagicMock(side_effect=lambda spec, out: Path(out) / "input_spec.json"),
+        )
+        monkeypatch.setattr(
+            gd,
+            "upload_spec",
+            MagicMock(return_value="r2://stub-bucket/stub-key/input_spec.json"),
+        )
+        monkeypatch.setattr(gd.r2_io, "ensure_r2_env_loaded", MagicMock(return_value=None))
+
+    def test_main_resolves_output_dir_under_hydra_main(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inside main(), cfg.paths.output_dir equals HydraConfig.get().runtime.output_dir.
+
+        Pins the @hydra.main decoration contract: the per-run dir is supplied by
+        Hydra runtime rather than pinned by the launcher to a hand-picked anchor.
+
+        :param monkeypatch: Pytest fixture used to patch ``sys.argv`` + capture cfg.
+        """
+        from hydra.core.hydra_config import HydraConfig
+
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+
+        observed: dict[str, str] = {}
+        real_spec_from_cfg = gd.spec_from_cfg
+
+        def _capture_then_build(cfg: object) -> DatasetSpec:
+            observed["output_dir"] = cfg.paths.output_dir  # type: ignore[attr-defined]
+            observed["runtime_output_dir"] = HydraConfig.get().runtime.output_dir
+            return real_spec_from_cfg(cfg)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(gd, "spec_from_cfg", _capture_then_build)
+
+        gd.main()
+
+        assert observed["output_dir"] == observed["runtime_output_dir"]
 
 
 def test_smoke_job_name_rejects_unsafe_task_name() -> None:
