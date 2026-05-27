@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from synth_setter.pipeline.ci.spec_uri import compute_spec_uri, main
+from synth_setter.pipeline.ci.spec_uri import (
+    compute_spec_uri,
+    compute_spec_uri_from_hydra,
+    main,
+)
 from synth_setter.pipeline.schemas.spec import DatasetSpec
 
 
@@ -203,3 +207,286 @@ class TestMainCli:
         err = capsys.readouterr().err
         assert str(bad) in err
         assert "Traceback" not in err
+
+
+_HYDRA_EXPERIMENT = "generate_dataset/smoke-shard"
+
+
+class TestComputeSpecUriFromHydra:
+    """``compute_spec_uri_from_hydra`` derives the URI by Hydra-composing the dataset cfg."""
+
+    def test_matches_launcher_side_computation(self) -> None:
+        """URI equals what ``synth-setter-generate-dataset`` would compute via ``spec_from_cfg``.
+
+        Pins the load-bearing claim of this whole feature: the helper and the
+        launcher exercise the same derivation, so a CI cell consuming this URI
+        will hit the same R2 object the launcher writes. Catches drift between
+        ``_NON_SPEC_CFG_KEYS`` and ``cli.generate_dataset._NON_SPEC_KEYS`` and
+        any future divergence in cfg-to-spec construction.
+        """
+        from hydra import compose, initialize_config_module
+
+        from synth_setter.cli.generate_dataset import spec_from_cfg
+
+        overrides = [f"experiment={_HYDRA_EXPERIMENT}", "+run_id=parity-test"]
+        with initialize_config_module(version_base="1.3", config_module="synth_setter.configs"):
+            cfg = compose(config_name="dataset", overrides=overrides)
+        cfg.paths.root_dir = "."
+        cfg.paths.output_dir = "."
+        cfg.paths.work_dir = "."
+
+        launcher_uri = spec_from_cfg(cfg).r2.input_spec_uri()
+        helper_uri = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "parity-test")
+        assert helper_uri == launcher_uri
+
+    def test_non_spec_cfg_keys_mirror_cli_canonical(self) -> None:
+        """``_NON_SPEC_CFG_KEYS`` equals ``cli.generate_dataset._NON_SPEC_KEYS``.
+
+        Converts the comment-guarded "keep in sync" invariant into a tested
+        one. If either side gains a new top-level cfg sub-tree, this test
+        fails immediately rather than the helper silently feeding a non-spec
+        key into ``DatasetSpec(**spec_kwargs)``.
+        """
+        from synth_setter.cli.generate_dataset import _NON_SPEC_KEYS
+        from synth_setter.pipeline.ci.spec_uri import _NON_SPEC_CFG_KEYS
+
+        assert _NON_SPEC_CFG_KEYS == _NON_SPEC_KEYS
+
+    def test_run_id_override_lands_in_uri(self) -> None:
+        """The ``run_id_override`` argument appears verbatim in the under-prefix URI."""
+        uri = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "cell-runpod-hdf5")
+        assert "/cell-runpod-hdf5/input_spec.json" in uri
+        assert uri.endswith("/input_spec.json")
+        assert uri.startswith("r2://")
+
+    def test_uri_invariant_to_created_at_when_run_id_pinned(self) -> None:
+        """Two calls with the same ``run_id_override`` produce identical URIs.
+
+        The default ``created_at`` factory fires fresh on each compose, so the
+        only way both calls produce equal URIs is if ``run_id`` (pinned)
+        suppresses the ``created_at``-derived run_id factory and the prefix
+        derivation ignores ``created_at``. This pins the invariant the
+        downstream "validator computes URI from matrix coords" flow relies on.
+        """
+        uri_a = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "pinned")
+        uri_b = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "pinned")
+        assert uri_a == uri_b
+
+    def test_distinct_run_ids_produce_distinct_uris(self) -> None:
+        """Different ``run_id_override`` values produce different URIs."""
+        uri_a = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "cell-a")
+        uri_b = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "cell-b")
+        assert uri_a != uri_b
+        assert "/cell-a/" in uri_a and "/cell-b/" in uri_b
+
+    def test_uri_format_matches_canonical_prefix_template(self) -> None:
+        """URI follows ``r2://<bucket>/data/<task>/<run>/input_spec.json`` exactly."""
+        uri = compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "abc12345")
+        assert uri.endswith("/data/smoke-shard/abc12345/input_spec.json")
+
+
+class TestCliFromExperimentMode:
+    """``--from-experiment EXP --run-id-override RUNID`` CLI mode."""
+
+    def test_prints_uri_to_stdout(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Happy path: both flags set → exactly one URI line on stdout.
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "synth-setter-spec-uri",
+                "--from-experiment",
+                _HYDRA_EXPERIMENT,
+                "--run-id-override",
+                "cli-cell-42",
+            ],
+        )
+        main()
+        out = capsys.readouterr().out.strip()
+        assert out == compute_spec_uri_from_hydra(_HYDRA_EXPERIMENT, "cli-cell-42")
+
+    def test_equals_form_accepted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``--flag=value`` form is honored alongside the space-separated form.
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "synth-setter-spec-uri",
+                f"--from-experiment={_HYDRA_EXPERIMENT}",
+                "--run-id-override=eq-form-cell",
+            ],
+        )
+        main()
+        out = capsys.readouterr().out.strip()
+        assert "/eq-form-cell/" in out
+
+    def test_from_experiment_requires_run_id_override(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``--from-experiment`` alone surfaces a usage error + exit 1.
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        monkeypatch.setattr(
+            "sys.argv",
+            ["synth-setter-spec-uri", "--from-experiment", _HYDRA_EXPERIMENT],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        assert "Usage:" in capsys.readouterr().err
+
+    def test_run_id_override_requires_from_experiment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``--run-id-override`` alone surfaces a usage error + exit 1.
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        monkeypatch.setattr(
+            "sys.argv",
+            ["synth-setter-spec-uri", "--run-id-override", "orphaned"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        assert "Usage:" in capsys.readouterr().err
+
+    def test_positional_and_flag_modes_are_mutually_exclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Mixing positional ``spec.json`` with ``--from-experiment`` exits 1.
+
+        :param tmp_path: Pytest fixture providing a fresh test directory.
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        spec_path = _write_spec(tmp_path)
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "synth-setter-spec-uri",
+                str(spec_path),
+                "--from-experiment",
+                _HYDRA_EXPERIMENT,
+                "--run-id-override",
+                "mixed",
+            ],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        assert "Usage:" in capsys.readouterr().err
+
+    def test_unknown_experiment_exits_three_without_traceback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Hydra failures (missing experiment, bad override) collapse to exit 3.
+
+        Reuses ``_EXIT_INVALID_SPEC`` so log scanners that already grep exit 3
+        for "spec didn't validate" pick up compose failures too — both signal
+        "the caller couldn't get a usable spec from the input".
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        import uuid
+
+        # Randomized name so a future contributor naming a real experiment can't
+        # silently flip this test from negative-case to positive-case.
+        bogus = f"generate_dataset/does-not-exist-{uuid.uuid4().hex}"
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "synth-setter-spec-uri",
+                "--from-experiment",
+                bogus,
+                "--run-id-override",
+                "x",
+            ],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 3
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+
+    def test_experiment_named_usage_does_not_trip_sentinel(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """``--from-experiment __usage__`` reaches Hydra, not the sentinel branch.
+
+        Defends the upgrade from the prior ``"__usage__"`` magic string to a
+        class-based sentinel: a user passing ``--from-experiment __usage__``
+        now hits Hydra compose (which fails because no such experiment file
+        exists, exit 3) rather than being misrouted into the usage-error
+        branch (exit 1).
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "synth-setter-spec-uri",
+                "--from-experiment",
+                "__usage__",
+                "--run-id-override",
+                "x",
+            ],
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 3, "should reach compose, not the usage branch"
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+        assert "__usage__" in err
+
+    def test_usage_text_uses_live_argv_program_name(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Usage banner uses ``Path(sys.argv[0]).name`` rather than hard-coding the script name.
+
+        A ``python -m synth_setter.pipeline.ci.spec_uri`` invocation (or any
+        non-default entrypoint) should display the actual command the operator
+        just ran.
+
+        :param monkeypatch: Pytest fixture used to set ``sys.argv``.
+        :param capsys: Pytest fixture capturing stdout/stderr.
+        """
+        monkeypatch.setattr("sys.argv", ["/usr/local/bin/aliased-spec-uri"])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "aliased-spec-uri" in err
+        assert "synth-setter-spec-uri" not in err
