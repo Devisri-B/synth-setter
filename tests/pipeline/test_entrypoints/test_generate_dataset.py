@@ -1637,9 +1637,273 @@ class TestMainDispatchBranches:
 
         finalize_mock.assert_not_called()
         info_messages = [str(c.args[0]) for c in mock_logger.info.call_args_list]
-        ignored_lines = [m for m in info_messages if "finalize_inline=true ignored" in m]
+        ignored_lines = [
+            m for m in info_messages if "finalize_inline=True" in m and "ignored" in m
+        ]
         assert len(ignored_lines) == 1, (
-            f"expected exactly one INFO log mentioning 'finalize_inline=true ignored'; "
+            f"expected exactly one INFO log mentioning 'finalize_inline=True' + 'ignored'; "
+            f"got messages: {info_messages!r}"
+        )
+
+    def test_main_oracle_eval_inline_true_invokes_subprocess(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """oracle_eval_inline=true on the local-run branch shells out to synth-setter-eval.
+
+        Asserts the eval helper fires once with ``dataset_root`` under
+        ``_OPERATOR_WORKSPACE/oracle_eval/<run_id>/`` and that
+        ``_download_finalized_splits`` populates the same path first.
+
+        :param monkeypatch: Patches argv + the four module-level seams.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+            "finalize_inline=true",
+            "oracle_eval_inline=true",
+            # Override smoke-shard's [12, 0, 0] — the zero-size guard rejects
+            # train_val_test_sizes with any zero split for oracle_eval_inline.
+            "train_val_test_sizes=[12, 4, 4]",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setattr(gd, "generate", lambda _spec, _work_dir: None)
+        monkeypatch.setattr(gd, "finalize_from_spec", MagicMock())
+        download_mock = MagicMock()
+        monkeypatch.setattr(gd, "_download_finalized_splits", download_mock)
+        oracle_mock = MagicMock()
+        monkeypatch.setattr(gd, "_run_oracle_eval_subprocess", oracle_mock)
+
+        gd.main()
+
+        oracle_mock.assert_called_once()
+        dataset_root = oracle_mock.call_args[0][0]
+        assert isinstance(dataset_root, Path)
+        assert dataset_root.parent.name == "oracle_eval", (
+            f"dataset_root should land under <workspace>/oracle_eval/<run_id>/; got {dataset_root!r}"
+        )
+        download_mock.assert_called_once()
+        _, downloaded_dest = download_mock.call_args[0]
+        assert downloaded_dest == dataset_root
+
+    def test_run_oracle_eval_subprocess_builds_expected_argv(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Helper subprocesses ``synth_setter.cli.eval`` with the contract argv.
+
+        Pins the load-bearing overrides (``experiment=surge/fake_oracle``,
+        ``data.dataset_root``, ``ckpt_path=null``, ``mode=test``). Runs the
+        helper directly so cfg-resolution noise can't mask an argv drift.
+
+        :param monkeypatch: Patches the module's ``subprocess.run``.
+        :param tmp_path: Stands in for the finalize download directory.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        run_mock = MagicMock()
+        monkeypatch.setattr(gd.subprocess, "run", run_mock)
+
+        gd._run_oracle_eval_subprocess(tmp_path)
+
+        run_mock.assert_called_once()
+        called_argv = run_mock.call_args[0][0]
+        assert "-m" in called_argv
+        assert "synth_setter.cli.eval" in called_argv
+        assert "experiment=surge/fake_oracle" in called_argv
+        assert f"data.dataset_root={tmp_path}" in called_argv
+        # Pins the Hydra per-run dir to the same path as data.dataset_root so
+        # the workflow's metrics.json glob lands at <tmp_path>/metrics/metrics.json.
+        assert f"hydra.run.dir={tmp_path}" in called_argv
+        assert "ckpt_path=null" in called_argv
+        assert "mode=test" in called_argv
+
+    def test_main_oracle_eval_inline_default_false_skips(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Opt-in invariant: default false ⇒ neither download nor eval subprocess fires.
+
+        :param monkeypatch: Patches argv + the four module-level seams.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+            "finalize_inline=true",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setattr(gd, "generate", lambda _spec, _work_dir: None)
+        monkeypatch.setattr(gd, "finalize_from_spec", MagicMock())
+        download_mock = MagicMock()
+        oracle_mock = MagicMock()
+        monkeypatch.setattr(gd, "_download_finalized_splits", download_mock)
+        monkeypatch.setattr(gd, "_run_oracle_eval_subprocess", oracle_mock)
+
+        gd.main()
+
+        download_mock.assert_not_called()
+        oracle_mock.assert_not_called()
+
+    def test_main_oracle_eval_inline_requires_finalize_inline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``oracle_eval_inline=true`` without ``finalize_inline=true`` raises pre-``generate()``.
+
+        :param monkeypatch: Patches argv + the three seams the test asserts are unreached.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+            "oracle_eval_inline=true",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setenv("HYDRA_FULL_ERROR", "1")
+        generate_mock = MagicMock()
+        finalize_mock = MagicMock()
+        oracle_mock = MagicMock()
+        monkeypatch.setattr(gd, "generate", generate_mock)
+        monkeypatch.setattr(gd, "finalize_from_spec", finalize_mock)
+        monkeypatch.setattr(gd, "_run_oracle_eval_subprocess", oracle_mock)
+
+        with pytest.raises(ValueError, match="requires finalize_inline=true"):
+            gd.main()
+        generate_mock.assert_not_called()
+        finalize_mock.assert_not_called()
+        oracle_mock.assert_not_called()
+
+    def test_main_oracle_eval_inline_rejects_wds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``oracle_eval_inline=true`` + ``output_format=wds`` raises before ``generate()``.
+
+        Eval reads HDF5 splits; WDS shards aren't consumed by the same loader.
+
+        :param monkeypatch: Patches argv + the three seams the test asserts are unreached.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+            "finalize_inline=true",
+            "oracle_eval_inline=true",
+            "output_format=wds",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setenv("HYDRA_FULL_ERROR", "1")
+        generate_mock = MagicMock()
+        finalize_mock = MagicMock()
+        oracle_mock = MagicMock()
+        monkeypatch.setattr(gd, "generate", generate_mock)
+        monkeypatch.setattr(gd, "finalize_from_spec", finalize_mock)
+        monkeypatch.setattr(gd, "_run_oracle_eval_subprocess", oracle_mock)
+
+        with pytest.raises(ValueError, match="only supports output_format=hdf5"):
+            gd.main()
+        generate_mock.assert_not_called()
+        finalize_mock.assert_not_called()
+        oracle_mock.assert_not_called()
+
+    def test_main_oracle_eval_inline_rejects_zero_size_split(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Fail-fast guard: ``oracle_eval_inline=true`` rejects ``[N, 0, 0]``-style sizes.
+
+        ``SurgeDataModule.setup()`` opens train/val/test ``.h5`` unconditionally
+        regardless of stage, so any zero-size split would FileNotFoundError
+        deep inside Lightning. The launcher catches the misconfig up front.
+
+        :param monkeypatch: Patches argv and the ``generate`` / ``finalize_from_spec``
+            / oracle-eval seams; the test asserts none of them is reached.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+            "finalize_inline=true",
+            "oracle_eval_inline=true",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setenv("HYDRA_FULL_ERROR", "1")
+        generate_mock = MagicMock()
+        finalize_mock = MagicMock()
+        oracle_mock = MagicMock()
+        monkeypatch.setattr(gd, "generate", generate_mock)
+        monkeypatch.setattr(gd, "finalize_from_spec", finalize_mock)
+        monkeypatch.setattr(gd, "_run_oracle_eval_subprocess", oracle_mock)
+
+        with pytest.raises(ValueError, match="train_val_test_sizes > 0"):
+            gd.main()
+        generate_mock.assert_not_called()
+        finalize_mock.assert_not_called()
+        oracle_mock.assert_not_called()
+
+    @patch("synth_setter.cli.generate_dataset.logger")
+    def test_main_oracle_eval_inline_ignored_in_dispatch_branch(
+        self,
+        mock_logger: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Dispatch branch: ``oracle_eval_inline=true`` is logged-and-ignored, not raised.
+
+        SkyPilot hands the run to a worker pod; oracle eval runs out-of-band
+        via its own workflow. Asserts no eval subprocess fires and the INFO
+        log mentions the override was ignored.
+
+        :param mock_logger: Patched ``generate_dataset.logger`` — the
+            established loguru capture pattern in this file.
+        :param monkeypatch: Patches argv + dispatch + the oracle-eval seam.
+        :param tmp_path: Holds the minimal compute template the dispatch
+            branch reads from disk.
+        """
+        import synth_setter.cli.generate_dataset as gd
+        import synth_setter.pipeline.skypilot_launch as sl
+
+        template = tmp_path / "template.yaml"
+        template.write_text("resources:\n  cloud: runpod\nenvs:\n  X: ''\n")
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+            f"skypilot_launch.compute_template={template}",
+            "oracle_eval_inline=true",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        monkeypatch.setattr(sl, "dispatch_via_skypilot", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            gd,
+            "generate",
+            lambda *_a, **_k: pytest.fail("generate must not fire on dispatch branch"),
+        )
+        oracle_mock = MagicMock()
+        monkeypatch.setattr(gd, "_run_oracle_eval_subprocess", oracle_mock)
+
+        gd.main()
+
+        oracle_mock.assert_not_called()
+        info_messages = [str(c.args[0]) for c in mock_logger.info.call_args_list]
+        ignored_lines = [
+            m for m in info_messages if "oracle_eval_inline=True" in m and "ignored" in m
+        ]
+        assert len(ignored_lines) == 1, (
+            f"expected exactly one INFO log mentioning 'oracle_eval_inline=True' + 'ignored'; "
             f"got messages: {info_messages!r}"
         )
 

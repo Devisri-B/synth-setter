@@ -8,18 +8,104 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
+from hydra import compose, initialize_config_module
+from hydra.core.global_hydra import GlobalHydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from synth_setter.cli import eval as eval_mod
 from synth_setter.cli.eval import (
     _COMPUTE_AUDIO_METRICS_MODULE,
+    _dump_metric_dict,
     _load_audio_metrics,
     _run_predict_postprocessing,
     evaluate,
 )
 from synth_setter.cli.train import train
+from synth_setter.data.vst import param_specs
+from synth_setter.workspace import operator_workspace
 from tests.helpers.run_if import RunIf
+
+
+@pytest.mark.requires_vst
+@pytest.mark.slow
+def test_evaluate_runs_oracle_with_null_ckpt_path(
+    tmp_path: Path,
+    surge_xt_smoke_datasets: Path,
+) -> None:
+    """Fake oracle returns ``batch["params"]`` verbatim, so ``test/param_mse`` is exactly zero.
+
+    The load-bearing invariant is that ``ckpt_path=null`` survives Hydra
+    composition into ``evaluate()`` and the oracle's exact-zero MSE reaches
+    the metric dict.
+
+    :param tmp_path: Pinned as Hydra ``paths.output_dir`` / ``paths.log_dir``.
+    :param surge_xt_smoke_datasets: Holds ``{train,val,test}.h5`` + ``stats.npz``.
+    """
+    with initialize_config_module(version_base="1.3", config_module="synth_setter.configs"):
+        cfg = compose(
+            config_name="eval.yaml",
+            return_hydra_config=True,
+            overrides=[
+                "experiment=surge/test-mps-fake-oracle",
+                "trainer=cpu",
+                f"model.net.d_out={len(param_specs['surge_4'])}",
+                "callbacks.log_per_param_mse.param_spec=surge_4",
+            ],
+        )
+
+    with open_dict(cfg):
+        cfg.paths.root_dir = str(operator_workspace())
+        cfg.paths.output_dir = str(tmp_path)
+        cfg.paths.log_dir = str(tmp_path)
+        cfg.data.dataset_root = str(surge_xt_smoke_datasets)
+        cfg.data.predict_file = str(surge_xt_smoke_datasets / "test.h5")
+        cfg.data.batch_size = 1
+        cfg.data.num_workers = 0
+        cfg.ckpt_path = None
+
+    HydraConfig().set_config(cfg)
+    try:
+        metric_dict, _ = evaluate(cfg)
+    finally:
+        GlobalHydra.instance().clear()
+
+    param_mse = metric_dict["test/param_mse"]
+    assert isinstance(param_mse, torch.Tensor)
+    assert param_mse.numel() == 1
+    assert param_mse.dtype.is_floating_point
+    assert torch.isfinite(param_mse), f"oracle test/param_mse must be finite; got {param_mse!r}"
+    assert param_mse.item() == 0.0
+
+
+def test_dump_metric_dict_writes_json_with_coerced_scalars(tmp_path: Path) -> None:
+    """Lightning tensors and numpy arrays are coerced to native floats / lists in ``metrics.json``.
+
+    Pins the artifact downstream gates (workflow asserter, CSV joiners) read from —
+    a torch / numpy dependency in those gates would force imports just to deserialize.
+
+    :param tmp_path: Hydra-style output dir; the ``metrics/`` subdir lands under it.
+    """
+    import json
+
+    import numpy as np
+
+    metric_dict = {
+        "test/param_mse": torch.tensor(0.0),
+        "test/per_param_mse": torch.tensor([0.0, 0.0, 0.0, 0.0]),
+        "audio/mss_mean": np.float32(0.5),
+        "raw/string": "v1",
+    }
+    out_path = _dump_metric_dict(metric_dict, tmp_path)
+
+    assert out_path == tmp_path / "metrics" / "metrics.json"
+    assert out_path.is_file()
+    payload = json.loads(out_path.read_text())
+    assert payload["test/param_mse"] == 0.0
+    assert payload["test/per_param_mse"] == [0.0, 0.0, 0.0, 0.0]
+    assert payload["audio/mss_mean"] == pytest.approx(0.5)
+    assert payload["raw/string"] == "v1"
 
 
 @pytest.mark.gpu

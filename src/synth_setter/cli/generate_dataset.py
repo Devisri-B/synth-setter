@@ -54,6 +54,7 @@ _NON_SPEC_KEYS: tuple[str, ...] = (
     "run_name",
     "skypilot_launch",
     "finalize_inline",
+    "oracle_eval_inline",
 )
 
 # Local spec-mirror anchor; ``operator_workspace()`` also publishes
@@ -63,6 +64,43 @@ _OPERATOR_WORKSPACE = operator_workspace()
 # Worker-side checkout path — baked WORKDIR of the dev-snapshot image, not the
 # launcher's workspace (which may not exist on the worker filesystem).
 _WORKER_REPO_ROOT = "/home/build/synth-setter"
+
+# Smoke-shard-sized; longer eval runs belong on the dispatch path, not inline.
+_ORACLE_EVAL_TIMEOUT_SECONDS = 600
+
+
+def _download_finalized_splits(spec: DatasetSpec, dest: Path) -> None:
+    """Download finalized ``{train,val,test}.h5`` from R2 into ``dest`` (created if missing).
+
+    :param spec: Resolves the per-split R2 URI via ``spec.r2.split_h5_uri``.
+    :param dest: Local directory to receive the three split files.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    for split in ("train", "val", "test"):
+        r2_io.download_to_path(spec.r2.split_h5_uri(split), dest / f"{split}.h5")
+
+
+def _run_oracle_eval_subprocess(dataset_root: Path) -> None:
+    """Run the fake-oracle eval on ``dataset_root`` to verify the param-array round-trip.
+
+    ``check=True`` so a non-zero eval exit (or wall-clock timeout) propagates
+    to the caller.
+
+    :param dataset_root: Holds the finalized HDF5 splits the eval datamodule reads.
+    """
+    argv = [
+        sys.executable,
+        "-m",
+        "synth_setter.cli.eval",
+        "experiment=surge/fake_oracle",
+        f"data.dataset_root={dataset_root}",
+        f"hydra.run.dir={dataset_root}",
+        "ckpt_path=null",
+        "logger=null",
+        "mode=test",
+    ]
+    logger.info(f"oracle_eval_inline subprocess: {argv}")
+    subprocess.run(argv, check=True, timeout=_ORACLE_EVAL_TIMEOUT_SECONDS)  # noqa: S603
 
 
 def _rclone_copy(src: str, dest: str) -> None:
@@ -478,10 +516,33 @@ def main(cfg: DictConfig) -> None:
     the authoritative source for the operator's task overrides.
 
     :param cfg: Hydra-composed dataset cfg.
+    :raises ValueError: ``oracle_eval_inline=true`` without
+        ``finalize_inline=true``, with ``output_format!=hdf5``, or with
+        a zero-size train / val / test split (the eval datamodule opens
+        all three split files unconditionally).
     """
     overrides = list(HydraConfig.get().overrides.task)
     spec = spec_from_cfg(cfg)
     sky_cfg = _sky_cfg_from_dataset_cfg(cfg)
+
+    if sky_cfg.compute_template is None and cfg.oracle_eval_inline:
+        if not cfg.finalize_inline:
+            raise ValueError(
+                "oracle_eval_inline=true requires finalize_inline=true; "
+                "the inline oracle eval reads the {train,val,test}.h5 files "
+                "finalize uploads to R2."
+            )
+        if cfg.output_format != "hdf5":
+            raise ValueError(
+                "oracle_eval_inline=true only supports output_format=hdf5; "
+                f"got {cfg.output_format!r}."
+            )
+        if any(size == 0 for size in spec.train_val_test_sizes):
+            raise ValueError(
+                "oracle_eval_inline=true requires all of "
+                f"train_val_test_sizes > 0; got {tuple(spec.train_val_test_sizes)}. "
+                "SurgeDataModule opens train.h5 / val.h5 / test.h5 unconditionally."
+            )
 
     # ``_OPERATOR_WORKSPACE`` is the launcher-side spec-mirror anchor; the
     # Hydra per-run dir (``cfg.paths.output_dir``) is shard-scoped, not the
@@ -508,11 +569,16 @@ def main(cfg: DictConfig) -> None:
         generate(spec, Path(cfg.paths.output_dir))
         if cfg.finalize_inline:
             finalize_from_spec(spec, _OPERATOR_WORKSPACE)
+        if cfg.oracle_eval_inline:
+            eval_dir = _OPERATOR_WORKSPACE / "oracle_eval" / spec.run_id
+            _download_finalized_splits(spec, eval_dir)
+            _run_oracle_eval_subprocess(eval_dir)
         return
 
-    if cfg.finalize_inline:
+    if cfg.finalize_inline or cfg.oracle_eval_inline:
         logger.info(
-            "finalize_inline=true ignored: "
+            f"finalize_inline={cfg.finalize_inline}, "
+            f"oracle_eval_inline={cfg.oracle_eval_inline} ignored: "
             f"skypilot_launch.compute_template={sky_cfg.compute_template!r} "
             "dispatches to a worker; finalize runs out-of-band via the "
             "finalize-dataset workflow."
