@@ -1,6 +1,26 @@
 # CHANGELOG
 
 
+## v8.9.1 (2026-05-27)
+
+### Bug Fixes
+
+- **ci**: Hoist r2 fields out of f-string in nightly-parallel-datagen
+  ([#1307](https://github.com/tinaudio/synth-setter/pull/1307),
+  [`74d9699`](https://github.com/tinaudio/synth-setter/commit/74d969926b3d2d544ab8ed7d7aee3709504bae9e))
+
+The `Resolve spec_uri from local materialized spec` step in `nightly-parallel-datagen.yml` was
+  syntactically invalid on the runner's Python 3.10 (ubuntu-22.04) because the f-string expression
+  part contained backslash-escaped quotes (`{r2[\"bucket\"]}`), which Python rejects with
+  `SyntaxError: f-string expression part cannot include a backslash` before 3.12. Single quotes are
+  unavailable because the script is wrapped in a single-quoted shell heredoc.
+
+Read `r2`, `bucket`, and `prefix` into locals before the f-string so the expression parts only
+  reference bare names. No behavior change.
+
+Fixes #1237.
+
+
 ## v8.9.0 (2026-05-27)
 
 ### Features
