@@ -34,6 +34,7 @@ __all__ = [
     "shard_uri",
     "to_rclone_path",
     "upload",
+    "upload_dir",
     "upload_to_uri",
 ]
 
@@ -55,6 +56,12 @@ _R2_STRUCTURAL_DEFAULTS: dict[str, str] = {
     "RCLONE_CONFIG_R2_TYPE": "s3",
     "RCLONE_CONFIG_R2_PROVIDER": "Cloudflare",
 }
+
+# rclone ``--timeout`` is the IO idle timeout, not a wall-clock cap. A whole eval
+# run dir — rendered audio, predictions, metrics — can stream far longer than a
+# single shard, so the directory upload bounds it generously rather than tripping
+# a healthy large transfer at the 5-minute default the single-file helpers use.
+_UPLOAD_DIR_TIMEOUT = "3h"
 
 
 def ensure_r2_env_loaded(env_file: Path | None = None) -> None:
@@ -233,6 +240,36 @@ def upload_to_uri(local_path: Path, r2_uri: str) -> None:
         "--timeout=300s",
         "--retries=3",
         str(local_path),
+        _to_rclone_path(r2_uri),
+    ]
+    subprocess.check_call(args)  # noqa: S603 — args from validated URI
+
+
+def upload_dir(local_dir: Path, r2_uri: str) -> None:
+    """Copy a local directory tree into an R2 prefix (upload mirror of the dir download).
+
+    ``rclone copy`` walks ``local_dir`` and writes each file under ``r2_uri``,
+    preserving the relative tree. ``--checksum`` skips files already present with
+    a matching hash, so a re-run is idempotent; the connect-timeout and retry
+    flags match the other helpers so a transient blip retries instead of failing
+    the caller, while the IO timeout is widened to :data:`_UPLOAD_DIR_TIMEOUT`
+    because a whole run dir can stream past the single-file default. Unlike the
+    download helper there is no ``--immutable`` — the caller is pushing its own
+    freshly-produced directory, not guarding an immutable dataset.
+
+    :param local_dir: Local directory whose contents land directly under
+        ``r2_uri`` (the directory itself is not nested under its own name).
+    :param r2_uri: ``r2://`` destination prefix; created implicitly by rclone.
+    """
+    args = [  # noqa: S607 — rclone resolved by image's PATH
+        "rclone",
+        "copy",
+        "-vv",
+        "--checksum",
+        "--contimeout=30s",
+        f"--timeout={_UPLOAD_DIR_TIMEOUT}",
+        "--retries=3",
+        str(local_dir),
         _to_rclone_path(r2_uri),
     ]
     subprocess.check_call(args)  # noqa: S603 — args from validated URI

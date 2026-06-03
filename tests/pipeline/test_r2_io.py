@@ -160,6 +160,77 @@ class TestDownloadDirNoOverwrite:
         assert "--retries=3" in args
 
 
+class TestUploadDir:
+    """Tests for upload_dir — directory→prefix upload (mirror of download_dir_no_overwrite)."""
+
+    def test_lands_local_tree_under_remote_prefix(
+        self, fake_r2_remote: Path, tmp_path: Path
+    ) -> None:
+        """Every file under ``local_dir`` is copied beneath the destination prefix.
+
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        :param tmp_path: Pytest tmp dir holding the local source tree.
+        """
+        local_dir = tmp_path / "run"
+        (local_dir / "metrics").mkdir(parents=True)
+        (local_dir / "metrics" / "metrics.json").write_text('{"ok": true}')
+        (local_dir / "config.log").write_text("cfg")
+
+        r2_io.upload_dir(local_dir, "r2://bucket/evals/run-1")
+
+        dest = fake_r2_remote / "bucket" / "evals" / "run-1"
+        assert (dest / "metrics" / "metrics.json").read_text() == '{"ok": true}'
+        assert (dest / "config.log").read_text() == "cfg"
+
+    def test_rejects_non_r2_uri(self, tmp_path: Path) -> None:
+        """A local-path destination is rejected — caller must pass an ``r2://`` URI.
+
+        :param tmp_path: Pytest tmp dir used to build a local source path.
+        """
+        with pytest.raises(ValueError, match="not an r2:// URI"):
+            r2_io.upload_dir(tmp_path / "run", "local-dest")
+
+    def test_reupload_overwrites_changed_file(self, fake_r2_remote: Path, tmp_path: Path) -> None:
+        """Re-uploading a changed source overwrites the remote copy — no ``--immutable``.
+
+        The caller pushes its own freshly-produced run dir, so a second upload
+        must replace stale objects rather than hard-fail the way the
+        ``--immutable`` download guard would.
+
+        :param fake_r2_remote: Local-typed rclone remote rooted at a tmp dir.
+        :param tmp_path: Pytest tmp dir holding the local source tree.
+        """
+        local_dir = tmp_path / "run"
+        local_dir.mkdir()
+        (local_dir / "metrics.json").write_text('{"param_mse": 1.0}')
+        r2_io.upload_dir(local_dir, "r2://bucket/evals/run-1")
+
+        (local_dir / "metrics.json").write_text('{"param_mse": 0.0}')
+        r2_io.upload_dir(local_dir, "r2://bucket/evals/run-1")
+
+        dest = fake_r2_remote / "bucket" / "evals" / "run-1"
+        assert (dest / "metrics.json").read_text() == '{"param_mse": 0.0}'
+
+    def test_command_widens_io_timeout_and_omits_immutable(self, tmp_path: Path) -> None:
+        """Pin the rclone verb, the 3h IO timeout, and the absence of ``--immutable``.
+
+        The widened ``--timeout`` lets a whole run dir stream past the single-file
+        default, and the missing ``--immutable`` is what lets a re-upload overwrite
+        — both unobservable from filesystem state. One argv assertion guards them.
+
+        :param tmp_path: Pytest tmp dir used to build the local source path.
+        """
+        with patch.object(r2_io.subprocess, "check_call") as mock_call:
+            r2_io.upload_dir(tmp_path / "run", "r2://bucket/evals/run-1")
+        args = mock_call.call_args[0][0]
+        assert args[:2] == ["rclone", "copy"]
+        assert "--immutable" not in args
+        assert "--checksum" in args
+        assert "--contimeout=30s" in args
+        assert "--timeout=3h" in args
+        assert "--retries=3" in args
+
+
 class TestUploadToUri:
     """Tests for upload_to_uri — file→file upload with reliability flags."""
 

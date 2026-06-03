@@ -14,6 +14,7 @@ from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
 
+from synth_setter.pipeline import r2_io
 from synth_setter.resources import as_file, vst_headless_wrapper
 from synth_setter.utils import (
     RankedLogger,
@@ -285,6 +286,43 @@ def _dump_metric_dict(metric_dict: dict[str, Any], output_dir: Path) -> Path:
     return out_path
 
 
+def _maybe_upload_output_dir(cfg: DictConfig, is_global_zero: bool) -> None:
+    """Mirror the whole Hydra run dir to R2 when ``evaluation.upload_output_dir_uri`` is set.
+
+    Opt-in: a null URI is a no-op. Runs last so every artifact — metrics,
+    predictions, rendered audio, config logs — is on disk before the copy. The
+    configured URI is the exact destination prefix; the run dir's contents land
+    directly beneath it. Credential validation is delegated to
+    :func:`r2_io.ensure_r2_env_loaded`, matching the datamodule's R2 prefetch.
+
+    Only the global-zero rank uploads: under DDP ``main`` runs on every rank
+    against the one shared ``output_dir``, so an ungated copy would race N
+    redundant uploads — the same rank gate :func:`evaluate` puts on predict
+    postprocessing.
+
+    :param cfg: Reads ``cfg.evaluation.upload_output_dir_uri`` (``r2://`` prefix or
+        null) and ``cfg.paths.output_dir`` (the local tree to copy).
+    :param is_global_zero: Whether this is the global-zero rank; non-zero ranks
+        return without touching R2.
+    :raises ValueError: ``upload_output_dir_uri`` is set but not an ``r2://`` URI;
+        checked before the credential ping so a misconfigured destination is
+        attributed to the URI rather than surfacing as an auth failure.
+    """
+    if not is_global_zero:
+        return
+    dest_uri = cfg.evaluation.get("upload_output_dir_uri")
+    if not dest_uri:
+        return
+    if not r2_io.is_r2_uri(dest_uri):
+        raise ValueError(
+            f"evaluation.upload_output_dir_uri must be an r2:// URI; got {dest_uri!r}."
+        )
+    output_dir = Path(cfg.paths.output_dir)
+    log.info(f"Uploading eval output dir {output_dir} to {dest_uri}")
+    r2_io.ensure_r2_env_loaded()
+    r2_io.upload_dir(output_dir, dest_uri)
+
+
 @hydra.main(version_base="1.3", config_path="pkg://synth_setter.configs", config_name="eval.yaml")
 def main(cfg: DictConfig) -> None:
     """Run the evaluation entrypoint.
@@ -295,8 +333,9 @@ def main(cfg: DictConfig) -> None:
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     extras(cfg)
 
-    metric_dict, _ = evaluate(cfg)
+    metric_dict, object_dict = evaluate(cfg)
     _dump_metric_dict(metric_dict, Path(cfg.paths.output_dir))
+    _maybe_upload_output_dir(cfg, object_dict["trainer"].is_global_zero)
 
 
 if __name__ == "__main__":
