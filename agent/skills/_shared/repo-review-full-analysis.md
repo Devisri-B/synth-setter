@@ -171,6 +171,8 @@ Transform each Step 2 BLOCK line into one bullet under `## PR health`: strip the
 
 The `findings` array now holds only BLOCK items (each posts as its own inline unresolved thread); WARNs live in `review_body`. The exact wording of `review_body` is up to the calling skill — `repo-review-full` writes the "each BLOCK posted below as an individual unresolved thread" phrasing; `repo-review-full-no-comments` writes a variant that says nothing was posted. Both reuse the `## PR health` and `## Advisory (WARN) findings` section formats.
 
+When the calling skill submits via `post_review.py` (i.e. `repo-review-full`), add a top-level `"event"`: `REQUEST_CHANGES` if any finding is a BLOCK (any `[*:block]`, including the folded PR-health BLOCKs), else `COMMENT` if any WARN exists, else `APPROVE`. `repo-review-full-no-comments` renders to chat and never posts, so it omits `"event"`.
+
 Write the JSON to a temp file:
 
 ```bash
