@@ -132,7 +132,13 @@ volumes at `/home/dev/.local/share/tmux/resurrect` and
 `/root/.local/share/tmux/resurrect` so tmux sessions saved by
 tmux-continuum (configured in `.devcontainer/tmux.conf`) survive container
 rebuilds for both `DEVCONTAINER_USER=dev` (the default) and opt-in
-`DEVCONTAINER_USER=root` sessions. The same devcontainer configs also
+`DEVCONTAINER_USER=root` sessions. Restore is opt-in (`@continuum-restore off`):
+a rebuilt container starts clean, and the saved session is brought back on
+demand with `prefix + Ctrl-r`. The VS Code terminal defaults to the
+`zellij` profile (tmux stays selectable); the `synth-setter-zellij-cache` and
+`synth-setter-zellij-cache-root` named volumes at `/home/dev/.cache/zellij`
+and `/root/.cache/zellij` persist zellij's serialized (resurrectable) sessions
+across rebuilds for the same two users. The same devcontainer configs also
 overlay `/home/build/synth-setter/plugins` with an anonymous volume so the
 baked `plugins/Surge XT.vst3` symlink survives the workspace bind mount —
 without it, the host's gitignored `plugins/` would shadow the baked file and
