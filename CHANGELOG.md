@@ -1,6 +1,176 @@
 # CHANGELOG
 
 
+## v8.18.0 (2026-06-05)
+
+### Continuous Integration
+
+- Fix generate-and-finalize-dataset workflow
+  ([`f744dcd`](https://github.com/tinaudio/synth-setter/commit/f744dcd7a3bb0947aeb27199b25aa305268b2c2b))
+
+The consolidated generate-and-finalize-dataset workflow ran synth-setter-generate-dataset on a bare
+  ubuntu-latest runner with no Surge XT VST3, so generation failed at extract_renderer_version with
+  "Plugin path does not exist: plugins/Surge XT.vst3" before any render. Generation renders real
+  audio and needs the plugin + headless X11 stack only the dev-snapshot image bakes.
+
+Run the job inside the dev-snapshot image under the Xvfb wrapper, mirroring
+  nightly-parallel-datagen.yml: docker run the CLI after ensure_plugin_symlinks.sh recreates the
+  plugins symlink the bind-mount shadows, with hydra.run.dir pinned under the mounted workspace so
+  the host reads the eval's metrics.json and log. WANDB_MODE=offline is set in-container only for
+  oracle_eval so the inline eval's resume=must stays hermetic. New image_tag input pins a specific
+  image.
+
+This ports the fix from the deleted generate-finalize-oracle-eval.yaml (closed PR #1337) onto the
+  workflow #1391 consolidated it into.
+
+Refs #1336
+
+### Features
+
+- **evaluation**: Symlink shuffle of pred audio to probe render order
+  ([#1444](https://github.com/tinaudio/synth-setter/pull/1444),
+  [`e7fb24b`](https://github.com/tinaudio/synth-setter/commit/e7fb24b75ef707dea0b1f95635df2192acf0a4f6))
+
+* feat(evaluation): symlink shuffle of pred audio to probe render order
+
+Add `shuffle_pred_audio`, an opt-in eval probe that builds a *new* directory of symlinks permuting
+  each `sample_*/pred.wav` across the rendered `audio/` dir while `target.wav` links back to its own
+  sample. Recomputing audio metrics against this view scores each target against a pred rendered
+  from the same params but a different render-order position — isolating render-order from parameter
+  variation (#489).
+
+Because the view is symlinks into the untouched source tree, nothing is mutated and no
+  crash-recovery snapshots are needed. The build is gated on every sample's `params.csv` being
+  identical (a permutation is only meaningful when each pred renders the same params) and the
+  permutation is redrawn until it differs from the identity.
+
+The probe is folded into `compute_audio_metrics` behind `--shuffle_pred_audio` / `--shuffle_seed`:
+  when set, it scores `output_dir/shuffled_audio` instead of the original. `cli/eval.py` forwards
+  the flags to the metrics subprocess when `evaluation.shuffle_pred_audio` is enabled (no effect
+  unless `compute_metrics` is also on). Defaults keep `mode: test`/`validate` unchanged.
+
+Refs #489
+
+* chore: sync uv.lock to package version 8.17.0
+
+The 8.17.0 release commit on main bumped pyproject.toml under [skip ci], so uv.lock kept the stale
+  8.16.0 editable-package version and `uv lock --check` fails on any branch cut from main.
+  Regenerate the lockfile to match.
+
+* fix(evaluation): harden shuffle_pred_audio against missing targets and unsafe dest
+
+Require target.wav in the sample-dir predicate so a dir missing it is skipped rather than producing
+  a dangling symlink. Reject a dest_dir nested inside audio_dir, and clear a stale dest that is a
+  file or symlink (not just a real dir) before building. Reword the docstring: the permutation is
+  non-identity overall but may keep some pred.wav in place — it is not a derangement.
+
+* docs(evaluation): clarify shuffle_pred_audio dest_dir clearing is build-gated
+
+The <2-sample-dir path returns the identity before any write, so a pre-existing dest_dir is left
+  untouched there rather than 'cleared first' as the docstring implied. Reword so the clearing is
+  described as part of a proceeding shuffle (>=2 dirs, uniform params), matching
+  validate-before-write. Addresses Copilot.
+
+### Refactoring
+
+- **data**: Type VST note params with a NoteParams TypedDict
+  ([#1427](https://github.com/tinaudio/synth-setter/pull/1427),
+  [`f09ded2`](https://github.com/tinaudio/synth-setter/commit/f09ded2c6649bab1238130a9e2f3f135efcb7cb7))
+
+The note-params dict is heterogeneous (pitch: int, note_start_and_end: tuple[float, float]) but was
+  typed as a flat dict, collapsing every key to the value-type union and tripping Pylance
+  reportArgumentType at the render_params call sites in generate_vst_dataset.py.
+
+Introduce a closed NoteParams TypedDict in param_spec.py and thread it through the generate path:
+  sample() returns it (one cast at the runtime-key construction source), and VSTDataSample,
+  generate_sample's fixed_note_params, and writers' fixed_note_params_list adopt it.
+  ParamSpec.encode's note_param_dict widens to Mapping[str, object] so the TypedDict flows in
+  without fighting the dynamic-key iteration.
+
+Propagate NoteParams to the VST tests: the shared _HARDCODED_NOTE_PARAMS fixture and the
+  _patched_sample / _assert_round_trip_matches helpers adopt it, and the now-satisfied encode
+  reportArgumentType ignore is dropped. The tests are not pyright-excluded, so this keeps the repo
+  pyright-clean.
+
+Touching param_spec.py also triggered ruff's pending typing-alias modernization (List/Tuple/Optional
+  -> builtins) across the file.
+
+No behavior change. predict_vst_audio.py and ParamSpec.decode are out of scope (unrelated
+  pre-existing type errors).
+
+Fixes #1426
+
+- **schemas**: Type output_format as an OutputFormat enum with .extension
+  ([#1438](https://github.com/tinaudio/synth-setter/pull/1438),
+  [`ee2f690`](https://github.com/tinaudio/synth-setter/commit/ee2f690bf3d439dc33b64dd3d33e4fd8b54d2b97))
+
+Replace the inline ``Literal["hdf5", "wds"]`` field type and the paired
+  ``OUTPUT_FORMAT_TO_EXTENSION`` / ``EXTENSION_TO_OUTPUT_FORMAT`` module maps with a single
+  ``OutputFormat(str, Enum)`` domain type. The enum owns the format↔suffix mapping as an
+  ``.extension`` property and a ``.from_extension`` reverse-lookup classmethod, so a format and its
+  shard suffix live in one place instead of two parallel dicts that had to be kept inverse by an
+  import-time guard.
+
+Subclasses ``str`` (not 3.11's ``StrEnum`` — the floor is 3.10) and the field sets
+  ``Field(strict=False)`` so raw "hdf5"/"wds" tokens from Hydra-composed configs and R2 JSON still
+  coerce; unknown tokens raise exactly as the prior Literal did, and JSON serialization is unchanged
+  (the enum value is the token).
+
+All consumers — finalize/reshard dispatch, the renderer-CLI suffix dispatch, and the
+  pre-construction spec validator — now dispatch on enum members or ``OutputFormat.from_extension``
+  instead of the removed maps.
+
+Refs #1436
+
+- **testing**: Autospec sky.Resources/Task in skypilot launcher tests
+  ([#1447](https://github.com/tinaudio/synth-setter/pull/1447),
+  [`3fc373f`](https://github.com/tinaudio/synth-setter/commit/3fc373f4100ddd0339636453833e9bc0cc3f9cdb))
+
+Replace the hand-maintained MagicMock(spec=[...]) attribute lists for sky.Resources and sky.Task in
+  TestOverrideImageId with unittest.mock.create_autospec against the real SDK classes. The spec now
+  tracks the installed SkyPilot surface automatically, so a renamed or removed attribute (copy /
+  set_resources / cloud / image_id) fails the test instead of silently passing a stale spec.
+
+Refs #1445
+
+### Testing
+
+- **generate_dataset**: Add resume-correctness tests for h5
+  ([#1441](https://github.com/tinaudio/synth-setter/pull/1441),
+  [`68c7ded`](https://github.com/tinaudio/synth-setter/commit/68c7ded9e68678a981b9fd2c0bf39b7135565228))
+
+* test(data): pin HDF5 resume correctness under absolute-row fixed-params contract
+
+PR #1430 changed the writer's fixed-params indexing from tail-aligned (fixed_list[i - start_idx],
+  length num_samples - start_idx) to absolute row (fixed_list[i], length num_samples). This adds
+  CPU-only regression tests (render_params stubbed, no plugin) pinning that h5 resume still
+  reconstructs the exact dataset a single uninterrupted run would:
+
+- note params are absolute-indexed on resume (the existing pin only varies synth params, so it
+  cannot distinguish absolute from tail for note rows); - a plain sampled-params resume preserves
+  already-written head rows; - a crashed-then-resumed copy reproduces the single-shot param_array; -
+  a re-run on a complete shard renders nothing (start_idx == num_samples); - a resume starting
+  mid-batch indexes by absolute row.
+
+Refs #1429
+
+* test(data): clarify _prewrite_resumable_head opens the shard path
+
+Address Copilot review: the helper itself opens `out` in append mode; reword the param doc to say so
+  rather than implying the path arrives open.
+
+- **testing**: Positively assert finalize short-circuits on bad output_format
+  ([#1446](https://github.com/tinaudio/synth-setter/pull/1446),
+  [`eda352f`](https://github.com/tinaudio/synth-setter/commit/eda352f8f7107f71505f082e98d687d8104b9ebd))
+
+The unsupported-output_format test asserted only that a ValueError is raised, coupling its pass to
+  the spec-load happening before dispatch: if the load moved after dispatch the test would silently
+  still pass. Add fail-fast download_to_path / upload stubs so a download or upload firing before
+  the raise — proof that a format branch ran — fails the test.
+
+Refs #1445
+
+
 ## v8.17.0 (2026-06-05)
 
 ### Features
