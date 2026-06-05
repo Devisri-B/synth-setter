@@ -1212,7 +1212,7 @@ class RenderConfig(BaseModel):
     velocity: int
     signal_duration_seconds: float
     min_loudness: float
-    samples_per_render_batch: int
+    samples_per_render_batch: int = 32
     samples_per_shard: int
     max_retries: int = 0        # per-shard retry budget for transient renderer failures
     parallel: bool = False      # dispatch shard renders concurrently (ThreadPoolExecutor)
