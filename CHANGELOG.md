@@ -1,6 +1,50 @@
 # CHANGELOG
 
 
+## v8.17.0 (2026-06-05)
+
+### Features
+
+- **generate_dataset**: Add param_sample_cadence
+  ([#1439](https://github.com/tinaudio/synth-setter/pull/1439),
+  [`2b0c7cc`](https://github.com/tinaudio/synth-setter/commit/2b0c7ccd501f458c70efea5d6aa427d193153dcc))
+
+* feat(pipeline): render a whole shard from one identical patch via param_sample_cadence
+
+Add a `param_sample_cadence` knob to `RenderConfig` (default `"sample"`, historical per-sample
+  draw). Set to `"shard"` and the shard's first sample draws params through the normal
+  loudness-gated path while every remaining sample reuses that exact patch — so the whole shard is a
+  single identical patch. This is a controlled probe for the per-patch render variance tracked in
+  #489: with params held constant, any residual audio variance is the renderer's, not the
+  parameters'. (Confirmed against the real Surge XT plugin: all `param_array` rows come out
+  byte-identical while the audio rows still differ — exactly the #489 phenomenon.)
+
+The field flows end-to-end automatically — `_GenerateCliArgs` inherits every `RenderConfig` field,
+  so the CLI grows a `--param_sample_cadence` flag and `build_generate_args` forwards it from the
+  dataset spec.
+
+Implementation reuses the existing `fixed_*_params` seam in `_render_in_batches`: sample 0 renders
+  with no fixed params, then its `synth_params` / `note_params` are captured and threaded into
+  samples 1..N. Combining `"shard"` with caller-supplied fixed-params lists raises `ValueError`. A
+  mid-shard HDF5 resume can't preserve the one-patch invariant, so `make_hdf5_dataset` re-renders a
+  partial shard from row 0 rather than resuming — keeping worker-retry resilience intact instead of
+  failing hard.
+
+Refs #489
+
+* docs(pipeline): note shard-cadence resume exception in data-pipeline resumability prose
+
+The HDF5 resumability paragraph stated the missing tail is always regenerated; under
+  param_sample_cadence="shard" a partial shard re-renders from row 0 instead. Surfaced by doc-drift
+  on PR #1439.
+
+* test(pipeline): add param_sample_cadence to validate_spec render fixture
+
+validate_structure derives required render fields from RenderConfig.model_fields, so the new
+  param_sample_cadence field must appear in the hand-written render dict or structural validation
+  reports it missing.
+
+
 ## v8.16.1 (2026-06-05)
 
 ### Bug Fixes
