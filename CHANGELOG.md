@@ -1,6 +1,194 @@
 # CHANGELOG
 
 
+## v8.26.0 (2026-06-06)
+
+### Continuous Integration
+
+- **vst-slow**: Raise job timeout to 120 min
+  ([#1522](https://github.com/tinaudio/synth-setter/pull/1522),
+  [`008bc04`](https://github.com/tinaudio/synth-setter/commit/008bc0416f7802fc3f007cb9d3ba5a70180b976b))
+
+The VST Slow Tests job chronically hits the 60-min job timeout and is cancelled rather than failing
+  on an assertion (3 of the last 5 main runs were cancelled at the timeout). Double timeout-minutes
+  to 120 to give the slow audio-similarity suite room to finish.
+
+### Features
+
+- **storage**: Wire use_artifact lineage across train and eval
+  ([#1509](https://github.com/tinaudio/synth-setter/pull/1509),
+  [`93afaea`](https://github.com/tinaudio/synth-setter/commit/93afaea18f3c8186fb2bd3af52da9c6e0505c192))
+
+* feat(storage): wire use_artifact lineage across train and eval
+
+Per storage-provenance-spec §5, every run must call run.use_artifact() on its inputs so the W&B
+  lineage DAG forms. No use_artifact() calls existed in src/, leaving runs disconnected.
+
+Add use_input_artifacts() in logging_utils: for each WandbLogger it calls
+  lg.experiment.use_artifact("{name}:{alias}") per ref — the experiment object (not wandb.Api) is
+  what records lineage edges. Failures warn and are swallowed so a lineage edge never aborts a run,
+  mirroring finalize_dataset._log_dataset_artifact.
+
+Training consumes data-{consumed_dataset_config_id} before fit; eval consumes
+  model-{consumed_train_config_id} then data-{consumed_dataset_config_id} before testing. The
+  consumed refs come from new opt-in cfg fields (null default, alias default `latest`); a null ref
+  is skipped, so wandb-free and unconfigured runs are a no-op. This PR is the consumer only — it
+  references producer artifacts by name and logs none.
+
+Refs #1467, #1470, #128 Closes #1474
+
+* fix(storage): make use_input_artifacts a true wandb-free no-op
+
+Copilot review: the helper imported lightning's WandbLogger unconditionally, which can raise when
+  wandb is absent even with no W&B loggers configured — contradicting the documented no-op contract
+  — and materialized refs before checking for any WandbLogger.
+
+Guard on find_spec("wandb") before the import and return early when no WandbLogger is present,
+  mirroring instantiators.close_loggers. refs is now materialized only after that gate, so a
+  wandb-free or non-wandb run never touches the refs iterable.
+
+* docs(provenance): record use_artifact lineage now wired in config + wandb docs
+
+This PR closes the dataset use_artifact / dataset_config_id-linkage Known Gaps in
+  configuration-reference §5; drop those rows, note the opt-in consumed_dataset_config_id /
+  consumed_train_config_id / consumed_artifact_alias keys, and add the lineage step to the
+  train/eval wandb-integration entry flows. Surfaced by the PR's doc-drift advisory.
+
+Refs #1467
+
+* fix(storage): rank-gate lineage and record it on test-only runs
+
+Addresses two Copilot review comments on PR #1509:
+
+- logging_utils.py: decorate use_input_artifacts with @rank_zero_only so DDP/spawned runs record
+  each consumed-artifact edge once on rank 0, matching log_hyperparameters / log_wandb_provenance in
+  the same module (comment 3366983053). - cli/train.py: hoist use_input_artifacts out of the train
+  block and gate on train OR test so a test-only run (train: False, test: True) still records the
+  dataset edge, satisfying storage-provenance-spec §5's every-run-consumes-its-inputs invariant
+  (comment 3366983063).
+
+Adds a rank!=0 no-op test for use_input_artifacts.
+
+Refs #1467, #1470, #128
+
+* test(provenance): pin use_artifact lineage calls in train and eval
+
+The use_input_artifacts helper and the _consumed_artifact_refs ref-builder were each unit-tested in
+  isolation, but nothing asserted that train() and evaluate() actually call the helper with the
+  right refs at the right point. Add seam tests that drive the real entrypoints with heavy
+  collaborators stubbed and pin: the train gate (train or test), the train no-edge path, and the
+  eval model-before-data ordering.
+
+Refs #1474
+
+* test(provenance): reset HydraConfig singleton between tests
+
+The provenance-wiring suite added on main asserts resolve_run_config_id falls back to cfg.task_name
+  outside a Hydra run. But tests that call HydraConfig().set_config (e.g.
+  test_train_surge_xt[surge/fake_oracle]) populate a process-global singleton that
+  GlobalHydra.instance().clear() leaves untouched, so the stale runtime.choices.experiment leaked
+  into test_train_provenance.py and pinned the run id to fake_oracle-<ts> instead of
+  flow_simple-<ts>. Merging main shifted the xdist distribution and surfaced the latent flake on the
+  3.10 worker.
+
+Add an autouse fixture in tests/conftest.py that clears the HydraConfig singleton on teardown, plus
+  a contract test pinning the reset.
+
+### Internal-Fix
+
+- **monitoring**: Wandb console=wrap fixes empty data-gen logs
+  ([#1506](https://github.com/tinaudio/synth-setter/pull/1506),
+  [`cf53fe8`](https://github.com/tinaudio/synth-setter/commit/cf53fe891d39f0d66399890b36c1862c355d644f))
+
+* internal-fix(monitoring): pin wandb console=wrap so data-gen logs reach the UI
+
+console=redirect (set in #1466) captures stdout/stderr into a local output.log at the fd level but
+  wandb 0.26.x never transmits that file to the run's filestream, so the UI Logs tab is empty even
+  on a clean finish(). Verified end-to-end against online runs: redirect -> logLineCount=0 and no
+  server-side output.log; wrap -> logLineCount>0 and output.log uploaded.
+
+Pin console=wrap, the only mode whose output reliably reaches the server, and invert the config-pin
+  guard accordingly.
+
+* internal-fix(monitoring): correct task_wrapper finally-block line range in wandb doc
+
+The W&B integration reference cited utils.py:101-106 for the wandb.finish() teardown, but the
+  finally block spans lines 98-108 and finish() is at 108 — the cited range excluded the actual call
+  (PR #1506 comment).
+
+Refs #1465
+
+### Refactoring
+
+- **data**: Flatten datasetsrc into flat copy_dataset_root field
+  ([#1505](https://github.com/tinaudio/synth-setter/pull/1505),
+  [`0c6b18d`](https://github.com/tinaudio/synth-setter/commit/0c6b18dd9c694833fd91dfcae966fe2eccef78f2))
+
+* refactor(data): flatten datasetsrc wrapper into a flat copy_dataset_root field
+
+The dataset-copy source was a single-field wrapper model (``DatasetSrcConfig.copy_dataset_root``)
+  nested under ``DatasetSpec.datasetsrc``, defaulting to ``datasetsrc: null`` in ``dataset.yaml``.
+  That null default is a Hydra struct footgun: a dotted ``datasetsrc.copy_dataset_root=...``
+  override fails because OmegaConf cannot index into a null node, forcing the awkward mapping form
+  ``datasetsrc='{copy_dataset_root: ...}'``.
+
+Replace the wrapper with a flat ``DatasetSpec.copy_dataset_root: str | None`` (``copy_dataset_root:
+  null`` in ``dataset.yaml``), so the override is simply ``copy_dataset_root=<path>``. The
+  blank-string and hdf5-only validators move onto ``DatasetSpec``; the rich copy-source rationale
+  (#724 min_loudness note) moves onto the field description.
+
+Back-compat: a ``mode="before"`` shim (mirroring ``_normalize_r2_input``)
+
+promotes legacy ``datasetsrc: {copy_dataset_root: X}`` to the flat key and drops ``datasetsrc:
+  null``, so ``input_spec.json`` files already materialized to R2 still load (verified against an
+  existing smoke-shard spec).
+
+Refs #1429
+
+* refactor(data): tighten copy_dataset_root docs and cover legacy shim edges
+
+Address pre-PR review WARNs: trim the ``copy_dataset_root`` field description to its contract (the
+  hdf5-only and param_spec_name constraints are owned by the validators and
+  ``validate_copy_source``), and add tests for the back-compat shim's previously-uncovered branches
+  — a non-mapping legacy ``datasetsrc`` is rejected, an empty legacy mapping disables copy, and a
+  serialized legacy-shaped spec reloads through ``model_validate_json``.
+
+* docs(data): note legacy datasetsrc back-compat shim in the copy section
+
+Refs #1502
+
+* refactor(data): reject unexpected keys in legacy datasetsrc mapping
+
+Per review: the back-compat shim previously read only copy_dataset_root from a legacy datasetsrc
+  mapping, silently dropping any other key. Restore the single-key strictness the removed
+  DatasetSrcConfig (extra="forbid") enforced so a typo'd legacy key fails loudly instead of silently
+  disabling the copy path.
+
+* refactor(data): make legacy datasetsrc back-compat strict and loud
+
+Address Copilot re-review: (1) from_hydra_cfg masks the composed cfg to model fields before the
+  promotion shim runs, so a stale Hydra `datasetsrc` override would silently vanish — reject it with
+  a migration pointer to copy_dataset_root. (2) A non-null legacy datasetsrc mapping must hold
+  exactly a non-null copy_dataset_root (empty/null-inner now raises) so a typo can't quietly disable
+  copy; use `datasetsrc: null` to disable. Mirrors the removed DatasetSrcConfig's required-field
+  contract on the back-compat path.
+
+### Testing
+
+- **testing**: Clamp pytest-xdist -n auto by available memory
+  ([#1524](https://github.com/tinaudio/synth-setter/pull/1524),
+  [`972ae62`](https://github.com/tinaudio/synth-setter/commit/972ae6245bc87112268e3c4486b9b0a958a81c6d))
+
+The cgroup-aware CPU clamp only bounds workers by CPU quota. On a shared host with no
+  cpu.max/memory.max set, -n auto spawns one worker per host core; aggregate worker RSS across
+  concurrent worktree runs exhausts RAM and the OOM-killer SIGTERMs the run (exit 143).
+
+Add a memory-aware clamp: min(host MemAvailable, cgroup memory limit) / per-worker budget
+  (PYTEST_XDIST_WORKER_MEM_MB, default 1 GiB); the hook now returns min(cpu, memory). Add a low
+  PYTEST_XDIST_AUTO_NUM_WORKERS default to the devcontainer configs so shared-host worktrees default
+  low, with the per-run override preserved.
+
+
 ## v8.25.0 (2026-06-06)
 
 ### Chores
