@@ -1182,6 +1182,32 @@ class TestRun:
         assert captured["src"] == tmp_path / spec.shards[0].filename
         assert captured["existed_at_upload"] is True
 
+    def test_provenance_not_stamped_when_no_wandb_logger(
+        self,
+        patched_subprocess: MagicMock,  # noqa: ARG002
+        spec: DatasetSpec,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``log_wandb_provenance`` is skipped when ``loggers`` owns no ``WandbLogger``.
+
+        Provenance mutates the process-global ``wandb.run``; gating the call on a
+        locally-owned ``WandbLogger`` keeps an empty-logger run from stamping a
+        foreign in-process run, mirroring the ``_close_loggers`` ownership guard.
+
+        :param patched_subprocess: Fixture-activation only; the renderer
+            materializes the shard so the run reaches its summary.
+        :param spec: Fixture-provided single-shard ``DatasetSpec``.
+        :param tmp_path: Caller-supplied work_dir for ``generate()``.
+        :param monkeypatch: Installs the ``log_wandb_provenance`` spy.
+        """
+        provenance = MagicMock()
+        monkeypatch.setattr("synth_setter.cli.generate_dataset.log_wandb_provenance", provenance)
+
+        generate(spec, tmp_path, [])
+
+        provenance.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # build_generate_args — arg construction from spec + shard
@@ -1482,6 +1508,44 @@ class TestMainDispatchBranches:
         spec = recorded.get("spec")
         assert isinstance(spec, DatasetSpec)
         assert spec.render.plugin_path == str(TEST_PLUGIN_VST3)
+
+    def test_local_run_applies_extras_writing_tags_and_config_tree(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``main()`` runs ``extras(cfg)`` before generating, materializing its artifacts.
+
+        ``dataset.yaml`` composes ``extras: default`` (``enforce_tags`` +
+        ``print_config`` true) and a non-empty ``tags``, so ``extras(cfg)``
+        exports ``tags.log`` and ``config_tree.log`` to ``cfg.paths.output_dir``.
+        Asserting those files exist verifies the entrypoint applied extras via
+        its observable side effects rather than mocking the call.
+
+        :param monkeypatch: Pytest fixture used to patch argv + ``generate``.
+        """
+        import synth_setter.cli.generate_dataset as gd
+
+        argv = [
+            "synth-setter-generate-dataset",
+            "experiment=generate_dataset/smoke-shard",
+            f"render.plugin_path={TEST_PLUGIN_VST3}",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+
+        recorded: dict[str, Path] = {}
+
+        def _fake_run(_spec: object, work_dir: Path, _loggers: object) -> None:
+            recorded["work_dir"] = work_dir
+
+        monkeypatch.setattr(gd, "generate", _fake_run)
+
+        gd.main()
+
+        output_dir = recorded["work_dir"]
+        for artifact in ("tags.log", "config_tree.log"):
+            path = output_dir / artifact
+            assert path.is_file(), f"extras did not write {artifact}"
+            assert path.stat().st_size > 0, f"{artifact} is empty"
 
     def test_compute_template_set_calls_dispatch_via_skypilot(
         self,
