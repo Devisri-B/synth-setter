@@ -1,6 +1,227 @@
 # CHANGELOG
 
 
+## v8.18.4 (2026-06-06)
+
+### Automation
+
+- Link worktree thoughts/ to the primary central copy
+  ([#1469](https://github.com/tinaudio/synth-setter/pull/1469),
+  [`7c57d37`](https://github.com/tinaudio/synth-setter/commit/7c57d3767c52c1ee3bd571d6abc97d79691d8872))
+
+* feat(ci-automation): link worktree thoughts/ to the primary central copy
+
+qrspi skills write to a relative thoughts/shared/ path, so each gitignored per-worktree thoughts/
+  isolates the R->S->P->I doc chain and scatters output. Add a `make link-thoughts` target (sibling
+  of link-plugins) that symlinks a worktree's thoughts/ to the primary checkout's central one,
+  migrating any pre-existing files and preserving a divergent collision as <name>.from-<worktree>
+  rather than dropping it. Chain it into the SessionStart banner and worktree-guard spawn command so
+  new worktrees get it automatically, and drop the trailing slash on the .gitignore entry so the
+  symlink itself is ignored.
+
+Closes #1468
+
+* docs(doc-map): list link-thoughts in the Makefile covers entry
+
+Refs #1468
+
+* fix(ci-automation): relink off-central thoughts symlink and preserve spaced paths
+
+A thoughts symlink pointing somewhere other than central was treated as a successful no-op; now it
+  is repointed to central. The migration loop's `read` lacked `IFS=`, trimming whitespace from paths
+  with spaces; set it for POSIX-safe preservation.
+
+* fix(ci-automation): abort thoughts migration if file enumeration fails
+
+In /bin/sh the recipe has no pipefail, so a failing `find` in the `find | while` pipeline was masked
+  and `rm -rf` could still delete un-migrated notes. Enumerate into a temp file with an explicit
+  failure check and read the loop from it, which also moves the loop out of the subshell so a failed
+  cp/mkdir aborts the recipe before the removal.
+
+* Update getting-started.md (thoughts/ details not needed)
+
+### Bug Fixes
+
+- **cli**: Preserve exception cause on generate_dataset failure path
+  ([#1477](https://github.com/tinaudio/synth-setter/pull/1477),
+  [`9096f1b`](https://github.com/tinaudio/synth-setter/commit/9096f1b81c7db918fa428e3f2d4463e96e103f87))
+
+On the generate dataset failure path, object_size parsed rclone lsf stdout with a bare int(out):
+  non-integer output (unexpected listing, garbage) raised a context-free ValueError that named
+  neither the probed URI nor the rclone payload, so the cause was lost as the error propagated
+  through generate()'s except/finally.
+
+Guard the parse and re-raise a contextual RuntimeError chained via 'from exc', keeping the original
+  ValueError as __cause__ and naming the probed URI.
+
+Refs #1475
+
+### Chores
+
+- **logging**: Replace stray print() with structured logging
+  ([#1476](https://github.com/tinaudio/synth-setter/pull/1476),
+  [`815a023`](https://github.com/tinaudio/synth-setter/commit/815a023df973a8dded474b46a6e41acc851fcb7b))
+
+Convert the nine print() calls in get_stats_hdf5 to the module's existing stdlib logger (the file
+  already standardizes on logging.getLogger), using lazy %-formatting and snake_case-style event
+  messages. The two full-array mean/std dumps become a single shape-logging line so real mel specs
+  don't flood INFO logs with megabyte-scale array text.
+
+Delete the stray print("plotting") debug breadcrumb in PlotLearntProjection (utils/, non-pipeline) —
+  it sits directly below commented-out debug prints and the callback emits no other logging, so it
+  is leftover noise rather than an intentional log line.
+
+Refs #1475
+
+### Testing
+
+- **_meta**: Hard-block config-initializer imports in entrypoint tests
+  ([#1461](https://github.com/tinaudio/synth-setter/pull/1461),
+  [`091e336`](https://github.com/tinaudio/synth-setter/commit/091e33682d14b5bf99817c764599f67873b669ec))
+
+* test(_meta): hard-block Hydra config-initializer imports in entrypoint test modules
+
+test_generate_dataset.py and test_train.py are for e2e tests that drive from_hydra / train /
+  subprocess. Config-layer tests (Hydra compose + spec_from_cfg without running the entrypoint)
+  belong in tests/pipeline/configs/.
+
+The tell is a direct initialize_config_module (or its variants) import: it means the test manages
+  its own Hydra lifecycle, which is config-layer work. This AST check bans those imports from the
+  canonical entrypoint modules so the invariant is hard-blocked going forward.
+
+test_eval.py is excluded — it legitimately composes a cfg inline and immediately calls
+  evaluate(cfg), which is e2e.
+
+Refs #1455
+
+* deps: sync uv.lock to synth-setter 8.18.0
+
+Lock was at 8.17.0 from before the 8.18.0 release landed on main.
+
+* docs: update testing.md and doc-map.yaml for tests/_meta/
+
+- Move test_generate_dataset.py from "Hydra-config validation" to a new "E2E dataset-generation
+  entrypoint" row — the meta-test asserts it must stay entrypoint-only - Add "Structural invariants
+  (meta-tests)" row for tests/_meta/ - Add tests/_meta/** source entry to doc-map.yaml
+
+* docs(meta): tighten module docstring to state the actual enforced invariant
+
+The docstring said "contain only e2e tests" but the check only bans Hydra config-initializer
+  imports; over-promising what is enforced. Reword to describe the specific import restriction that
+  is asserted.
+
+* docs(meta): restore shuffle_pred_audio entry; tighten doc-map covers
+
+Restore the `shuffle_pred_audio.py` source entry in doc-map.yaml that was accidentally dropped when
+  the testing.md doc-drift changes were applied. Tighten the `tests/_meta/**` covers text to
+  describe only the invariant that is actually implemented.
+
+Tighten _direct_hydra_compose_imports :returns: to name what the function actually returns.
+
+Refs #1345
+
+* docs(meta): tighten testing.md row to match enforced invariant
+
+The test_generate_dataset.py table row claimed the module is 'e2e only (enforced by
+  tests/_meta/test_entrypoint_e2e_only.py)', but the meta-test only blocks direct Hydra
+  config-initializer imports (initialize/initialize_config_dir/initialize_config_module) — it does
+  not prevent other non-e2e assertions from existing. Reword to state the specific invariant being
+  enforced.
+
+* fix(hooks): skip readiness gates for merged/closed PRs
+
+`mergeable=UNKNOWN` is the GitHub API's normal response for a PR that has already been merged; it
+  does not mean the PR is conflicting. The hook was treating this as a Gate 2 failure and blocking
+  the turn even after the PR landed on main.
+
+Add a state check before the gate loop: exit 0 immediately when the PR is MERGED or CLOSED so the
+  stop hook never fires on finished work.
+
+* docs(_meta): enrich docstring param/returns with semantic constraints
+
+* docs(_meta): tighten doc-map covers and param contract prose
+
+- **testing**: Expand fast-loop coverage for eval + generate_dataset
+  ([#1460](https://github.com/tinaudio/synth-setter/pull/1460),
+  [`d2ad5f7`](https://github.com/tinaudio/synth-setter/commit/d2ad5f74f6002352425018b2d6beecae69521e51))
+
+* test(testing): expand fast-loop coverage — fake-oracle predict, postprocessing errors, WDS shards,
+  generate_dataset e2e
+
+- Add `fake_surge_smoke_datasets` fixture (FakeVST3Plugin, no real VST/X11) and
+  `_write_smoke_stats_npz()` helper to conftest; DRYs out `surge_xt_smoke_datasets` -
+  `tests/helpers/dummy_shards.py`: new `stub_renderer` consolidates `_write_dummy_h5_shard` from
+  `test_local_launcher_roundtrip.py` - `test_local_launcher_roundtrip.py`: switch to `stub_renderer`
+  (removes ~120 lines of inline HDF5 scaffolding) - `test_eval.py`:
+  `test_evaluate_predict_mode_merges_audio_metrics_into_metric_dict` — drives oracle predict + fake
+  postprocessing subprocesses end-to-end - `test_eval_postprocessing.py`:
+  `test_postprocessing_render_subprocess_nonzero_exit_raises`,
+  `test_postprocessing_metrics_subprocess_timeout_raises` — pin error propagation paths -
+  `test_fake_plugin_e2e.py`: `_fake_render_cfg()` helper + WDS shard coverage -
+  `test_generate_dataset.py`: `test_from_hydra_renders_every_shard_to_fake_r2_then_resume_skips` —
+  drives `from_hydra` e2e with `stub_renderer` and `fake_r2_remote` - `test_experiment_yamls.py`:
+  extend `DATASET_EXPERIMENTS` allowlist to cover `smoke-shard-with-finalize` and
+  `smoke-shard-with-oracle-eval`; assert `task_name`
+
+Refs #1258 Refs #1345
+
+* fix(testing): address review BLOCKs — Callable return type, assert→ValueError, comment hygiene
+
+- tests/test_eval.py: annotate _fake_postprocessing_subprocess -> Callable[[list[str]], None];
+  _fake_run **_kwargs: object; remove Any import - tests/helpers/dummy_shards.py: replace assert
+  with raise ValueError + add :raises: to docstring - tests/test_generate_dataset.py: fix C2 comment
+  (no literal config values); collapse two multi-line comments to 1–2 lines each -
+  tests/conftest.py: collapse 3-line stats-subprocess comment to 1 line -
+  tests/pipeline/configs/test_experiment_yamls.py: collapse 5-line DATASET_EXPERIMENTS comment -
+  tests/test_eval_postprocessing.py: drop :returns: None on -> None function
+
+* fix(testing): use **_kwargs: object in new postprocessing-error stubs
+
+Refs #1345
+
+* test(testing): address Copilot review on fast-loop eval/gen coverage
+
+Review feedback on PR #1460:
+
+- dummy_shards.py: type stub_renderer's side effect as returning None to match subprocess.check_call
+  (drop the int return and the rclone-branch return passthrough) (comments #3364679230, #3364679267)
+  - test_local_launcher_roundtrip.py: align the local _no_renderer_side_effect stub with the None
+  return - test_eval.py: null cfg.logger in _compose_fake_oracle_eval_cfg so the fast loop never
+  hits wandb init/network/login (comment #3364679282) - conftest.py: fix fake_surge_smoke_datasets
+  docstring to say _write_smoke_stats_npz runs the stats CLI as a subprocess, not in-process
+  (comment #3364679309)
+
+* test(testing): type resume-probe stub as None-returning, sync lock to 8.18.3
+
+- test_generate_dataset.py: _count_renderer now returns None (matching the None-returning
+  stub_renderer side effect), fixing the pyright int/None error - uv.lock: re-resolve after merging
+  main (8.18.2 -> 8.18.3)
+
+- **testing**: Replace sleep-sync and mock-only test assertions
+  ([#1479](https://github.com/tinaudio/synth-setter/pull/1479),
+  [`9d22b58`](https://github.com/tinaudio/synth-setter/commit/9d22b583a184170f4ac78627a2a091ae7cf6d36c))
+
+Remove wall-clock sleeps used as synchronization and mock-only assertions that never exercised
+  production routing across six test smells:
+
+- preset-coverage: drive editor warm-up through production warmup_plugin (the threading.Event the
+  editor exposes) instead of a sleep-then-set daemon thread. - vst/core slow-finish test: gate
+  show_editor on a body-started Event rather than time.sleep, keeping the body-exception-precedence
+  race deterministic. - callbacks: exercise real _log_figure dispatch against lightweight logger
+  stand-ins that subclass WandbLogger/TensorBoardLogger and record calls, so isinstance routing and
+  rank-gating run for real; mocks reserved for backends. - warmup_plugin test: assert the observable
+  effect (editor opened once, close event set) via a recording FakeVST3Plugin subclass, not a bare
+  mock call. - ot tuple collate: replace the pass-through _hungarian_match patch with a known-answer
+  optimal-transport check that proves sins co-data follows params under the optimal permutation. -
+  dataset spec: promote the duplicated _build_spec skeleton to a shared dataset_spec_factory fixture
+  in tests/conftest.py; both modules consume it.
+
+test_preset_coverage runs the real Surge VST3 under X11, so it only collects in this headless box;
+  runtime verification needs the plugin/Xvfb env.
+
+Refs #1475
+
+
 ## v8.18.3 (2026-06-05)
 
 ### Bug Fixes
