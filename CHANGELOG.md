@@ -1,6 +1,80 @@
 # CHANGELOG
 
 
+## v8.24.0 (2026-06-06)
+
+### Documentation
+
+- **agents**: Add import-ordering rule to avoid F401 autofix churn
+  ([#1519](https://github.com/tinaudio/synth-setter/pull/1519),
+  [`50b536a`](https://github.com/tinaudio/synth-setter/commit/50b536a6898adeeadcb3d7f796f9f48f790d1516))
+
+Agents repeatedly lose a cycle when an import is added in one edit and `make format` runs before the
+  using code lands: ruff's F401 autofix deletes the momentarily-unused import, forcing a re-add.
+  Document the fix (import with first use, or imports last) in AGENTS.md and mirror it into
+  CLAUDE.md's Python block.
+
+### Features
+
+- **training**: Log model-{config_id} W&B artifact with R2 reference
+  ([#1508](https://github.com/tinaudio/synth-setter/pull/1508),
+  [`a9b894e`](https://github.com/tinaudio/synth-setter/commit/a9b894eb746caaedf9705613dee8cbfff070d1b1))
+
+* chore(deps): sync uv.lock version to 8.23.0
+
+The 8.23.0 [skip ci] release commit bumped pyproject.toml but not uv.lock, leaving the lock's
+  synth-setter version at 8.22.0. Regenerate so CI's lock-check passes on branches cut from this
+  main.
+
+* feat(training): log explicit model-{config_id} W&B artifact with R2 reference
+
+train.py now logs a canonical model-{train_config_id} artifact (type model) to any configured
+  WandbLogger at train end, superseding reliance on Lightning's implicitly-named log_model:"all"
+  artifact (storage-provenance-spec §4-6). build_model_artifact records git_sha in artifact.metadata
+  and, when the new opt-in training.upload_checkpoints_uri (r2:// prefix or null) is set, adds an
+  s3:// reference to it (checksum=False, since R2's custom endpoint is not reachable by W&B's
+  reference handler). The null default logs a lineage-only artifact with no reference because R2
+  checkpoint upload is not implemented yet (#92). The opt-in URI mirrors eval's
+  evaluation.upload_output_dir_uri.
+
+_log_model_artifact is best-effort (warn-and-swallow) and a no-op without a WandbLogger, so
+  wandb-free callers are unchanged. Adds a shared r2_io.to_s3_uri helper and extracts
+  logging_utils.resolve_git_sha so train and provenance share one git-sha source.
+
+Closes #1472 Refs #1467, #1470, #146, #254
+
+* test(training): accept new training config block in baseline comparison
+
+train.yaml gained an opt-in training.upload_checkpoints_uri block, which the v0.0.0 baseline lacks.
+  Add training to ACCEPTED_DIFFS (mirroring evaluation) so the resolved-config equality test treats
+  the new block as a benign, non-model-knob divergence rather than drift.
+
+Refs #1472
+
+* fix(training): gate model-artifact logging to global-zero rank
+
+Copilot review: guard _log_model_artifact behind trainer.is_global_zero so DDP/FSDP ranks don't race
+  duplicate model artifact versions. Also drop the now-resolved 'Model run.log_artifact()' row from
+  configuration-reference §5.2 (this PR implements it); the dataset use_artifact row stays a gap
+  until #1474.
+
+Refs #1472, #1467
+
+* test(provenance): add offline-wandb e2e for model artifact wiring
+
+Drive the real train(cfg) entrypoint with a real WandbLogger(offline=True) and decode the
+  run-*.wandb binary to assert the model-{config_id} artifact (type model, git_sha metadata, opt-in
+  s3:// reference) actually lands. The existing unit tests feed a logger list to _log_model_artifact
+  directly and the cfg-level train tests pin a null logger, so dropping or mis-gating the
+  train()-end call passed every prior test; this closes that gap.
+
+* Potential fix for pull request finding
+
+Co-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>
+
+---------
+
+
 ## v8.23.2 (2026-06-06)
 
 ### Bug Fixes
