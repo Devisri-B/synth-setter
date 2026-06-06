@@ -1,6 +1,44 @@
 # CHANGELOG
 
 
+## v8.28.0 (2026-06-06)
+
+### Features
+
+- **finalize**: Take dataset_root_uri instead of spec uri
+  ([#1543](https://github.com/tinaudio/synth-setter/pull/1543),
+  [`f4a2051`](https://github.com/tinaudio/synth-setter/commit/f4a205176903471cadeb8c0f79de5c150d58a31f))
+
+* feat(finalize): take dataset_root_uri instead of spec uri
+
+finalize_dataset now accepts the dataset run-prefix directory rather than the full URI of
+  input_spec.json. A new spec_io.load_spec_from_root joins input_spec.json under the root
+  (tolerating a present/absent trailing slash) and delegates to load_spec_from_uri, so callers pass
+  the prefix the generate stage wrote (data/<task>/<run>/) and finalize discovers the spec itself.
+
+The reusable finalize-dataset.yaml workflow renames its input to dataset_root_uri;
+  generate-dataset-shards.yaml derives the root from the materialized spec_uri and forwards it.
+  Naming mirrors the existing datamodule download_dataset_root_uri convention.
+
+* test(finalize): pin load_spec_from_root filename join via captured uri
+
+The trailing-slash round-trip test only exercised a file:// root, where the double slash a missing
+  rstrip would leak gets normalized away — so the rstrip was a mutation survivor. Replace with a
+  parametrized test that captures the URI handed to load_spec_from_uri and asserts the exact
+  <root>/input_spec.json join for both slash forms over an r2:// root, where // is not collapsed.
+  Keep one local round-trip case for the read path.
+
+* docs(data-pipeline): tighten finalize doc-map covers entry
+
+Drop filler ("the", "on R2") and collapse the parenthetical rationale so the dataset_root_uri clause
+  reads terser, per comment-hygiene C12.
+
+* docs(data-pipeline): list load_spec_from_root in spec_io doc-map entry
+
+The spec_io covers entry enumerates the public readers but omitted the new load_spec_from_root — the
+  very helper the finalize entrypoint now uses. Add it so the doc-map stays in sync with __all__.
+
+
 ## v8.27.0 (2026-06-06)
 
 ### Build System
