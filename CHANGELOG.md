@@ -1,6 +1,160 @@
 # CHANGELOG
 
 
+## v8.23.0 (2026-06-06)
+
+### Chores
+
+- **devcontainer**: Remove tmux session persistence (TPM + resurrect + continuum)
+  ([#1497](https://github.com/tinaudio/synth-setter/pull/1497),
+  [`f6bfc6e`](https://github.com/tinaudio/synth-setter/commit/f6bfc6eff6cd113a16fa46ed0f22cd9426b1a119))
+
+Drop the tmux session-persistence stack from the devcontainer: the TPM bootstrap and non-interactive
+  plugin install in post-create.sh, the tmux-resurrect/tmux-continuum `@plugin` lines and tuning in
+  tmux.conf, and the per-user `synth-setter-tmux-resurrect{,-root}` named volumes from the cpu/gpu
+  devcontainer configs. tmux itself stays installed and selectable as a VS Code terminal profile
+  with the generic defaults (mouse, color, key bindings); only the cross-rebuild session
+  save/restore is removed.
+
+Add infra regression guards asserting no devcontainer mounts a tmux-resurrect volume, tmux.conf
+  declares no persistence plugins, and post-create.sh no longer bootstraps TPM. Update docker.md and
+  doc-map.yaml to match. Sync uv.lock to the 8.22.0 release version so the lock-check gate passes.
+
+- **storage**: R2 prefix write-time assertion helper
+  ([#1494](https://github.com/tinaudio/synth-setter/pull/1494),
+  [`285042b`](https://github.com/tinaudio/synth-setter/commit/285042bb5436f95c453b285385e04ee9038b38e9))
+
+* feat(storage): R2 prefix write-time assertion helper
+
+Add assert_r2_prefix_matches() to pipeline/schemas/prefix.py — a single-call guard that verifies a
+  materialized R2Location.prefix matches what make_r2_prefix() would derive from the same config_id,
+  run_id, and prefix_root. Called in finalize_from_spec() before any R2 objects are written so a
+  drifted prefix is caught at finalize time rather than silently corrupting the keyspace.
+
+Closes #281 Refs #1467
+
+* chore(storage): address review findings on r2-prefix-assertion
+
+- Drop redundant str() coercions in assert_r2_prefix_matches - Extend finalize_from_spec :raises:
+  docstring to cover prefix-mismatch ValueError - Derive _ASSERT_EXPECTED from make_r2_prefix (no
+  hardcoded string literals) - Move test constants to module level to satisfy pydoclint DOC601/603
+
+Refs #281
+
+* docs(storage): update finalize flow diagram and doc-map for assert_r2_prefix_matches
+
+Patch docs to reflect the new prefix-drift guard added to finalize_from_spec in the accompanying
+  implementation commit: - configuration-reference.md: insert assertion step in pseudocode flow -
+  doc-map.yaml: update finalize_dataset.py and prefix.py covers strings - data-pipeline.md: add
+  assert_r2_prefix_matches to module inventory comment
+
+### Features
+
+- **storage**: Log dataset W&B artifact with R2 refs on finalize
+  ([#1498](https://github.com/tinaudio/synth-setter/pull/1498),
+  [`14cb207`](https://github.com/tinaudio/synth-setter/commit/14cb207a40c6f0eb388ad0f57b4eafde6be15c5a))
+
+* chore(deps): sync uv.lock version to 8.22.0
+
+The 8.22.0 [skip ci] release commit bumped pyproject.toml but not uv.lock, leaving the lock's
+  synth-setter version at 8.21.0. Regenerate so CI's lock-check passes on branches cut from this
+  main.
+
+* refactor(logging): extract close_loggers from generate_dataset to instantiators
+
+The logger-finalize + guarded wandb.finish dance is needed by both the generate and finalize
+  data-pipeline entrypoints. Promote it from a private generate_dataset helper to a public
+  synth_setter.utils.instantiators.close_loggers (home of instantiate_loggers) so finalize can reuse
+  it without a cross-module private import. Behavior-preserving move; generate_dataset's call site
+  and the mirroring comment are updated.
+
+* feat(storage): log dataset W&B artifact with R2 references on finalize
+
+finalize now logs a canonical `data-{dataset_config_id}` artifact (type `dataset`) to any configured
+  WandbLogger, resuming the data-generation run pinned to spec.run_id so it lands on the producer
+  node of the lineage DAG (storage-provenance-spec §4-6). build_dataset_artifact references the
+  finalized R2 objects as s3:// URIs (per-split .h5 + stats.npz for hdf5; the shard prefix +
+  stats.npz for wds; checksum=False since R2's custom endpoint is unreachable by W&B's reference
+  handler) and records shard_count / n_samples / git_sha in artifact.metadata.
+
+Wiring is gated on a configured logger group, so the existing wandb-free finalize callers are an
+  unchanged no-op. Enabling it in production finalize composition is deferred to the finalize Docker
+  mode (#408).
+
+Also pins the merged #281 prefix-drift guard at the finalize_from_spec call site with an integration
+  test.
+
+Refs #1471, #1470, #1467
+
+* docs(storage): note dataset artifact logging in finalize_dataset doc-map covers
+
+* feat(storage): compose wandb logger in finalize so the dataset artifact logs in production
+
+The prior commit wired the artifact-logging path but gated it on a configured logger group, which
+  finalize_dataset.yaml did not compose — so the producer node of the lineage DAG never fired in the
+  live generate→finalize pipeline (generate-dataset-shards.yaml's unconditional finalize chain). Add
+  `logger: wandb` to the finalize config and forward the inherited WANDB_API_KEY secret into the
+  finalize-dataset.yaml run step. WandbLogger inits lazily and logging is best-effort, so a finalize
+  run without WANDB_API_KEY degrades to a no-op rather than aborting.
+
+Tests: the hydra-startup test now composes the wandb group (WANDB_MODE=disabled
+
+keeps it hermetic); the offline e2e pins the exact stats s3:// reference and the metadata
+  round-trip; adds a _r2_to_s3_uri non-r2-scheme guard test.
+
+Refs #1471
+
+* docs(storage): tighten finalize_dataset doc-map covers per review (C12)
+
+* docs(storage): sync wandb + provenance docs with finalize artifact logging
+
+Doc-drift from this PR's refactor + shipped feature: - wandb-integration.md: _close_loggers →
+  close_loggers (moved to instantiators); add data-{task_name} artifact row + finalize_dataset.py
+  entry-point row - storage-provenance-spec.md §4: drop '(planned)' from the dataset row, point
+  Logged By at finalize_dataset.py, refresh the note - doc-map.yaml: note the finalize config's
+  logger: wandb default
+
+### Testing
+
+- **fix**: Correct oracle-eval glob depth in shuffled-metrics test
+  ([#1495](https://github.com/tinaudio/synth-setter/pull/1495),
+  [`9c5572e`](https://github.com/tinaudio/synth-setter/commit/9c5572e3da85c79b3e94eee6e4eadf97f509d0e2))
+
+* fix(test): correct oracle-eval glob to oracle_eval/*/*/metrics/metrics.json
+
+The shuffled-metrics integration test used oracle_eval/*/metrics/metrics.json but the real layout
+  written by generate_dataset is oracle_eval/<split>/<run_id>/metrics/metrics.json — one wildcard
+  level short. The glob returned [] so the assertion always failed.
+
+Aligns with test_oracle_eval_inline_writes_bounded_audio_metrics which already uses the two-wildcard
+  form and asserts len == 3 (one file per split).
+
+Refs #489
+
+* fix(test): clarify oracle-eval metrics path template in comment
+
+Expands the trailing `/.' in the inline comment to show the full path template including the
+  `metrics/metrics.json` suffix, matching what the glob pattern encodes. Applies to both oracle-eval
+  integration tests.
+
+* fix(test): include split path in non-finite metrics assertion message
+
+Copilot finding: the failure message didn't identify which split's metrics.json caused the
+  assertion, making CI debugging harder. `metrics_file.parent.parent.name` is the split name
+  (train/val/test) since the layout is oracle_eval/<split>/<run_id>/metrics/metrics.json.
+
+* fix(test): use prefix_root override to satisfy assert_r2_prefix_matches
+
+Both oracle-eval integration tests used +r2.prefix=test-runs/... for R2 isolation, but
+  finalize_from_spec (PR #1494) now calls assert_r2_prefix_matches which validates that
+  spec.r2.prefix equals make_r2_prefix(prefix_root, task_name, run_id). A test-runs prefix doesn't
+  match the data/ canonical form derived from spec fields.
+
+Fix: override r2.prefix_root instead of r2.prefix. The spec model derives prefix from prefix_root +
+  task_name + run_id automatically (via _fill_default_r2_prefix), so the assertion holds. Cleanup
+  purges prefix_root + "/" which covers the derived subtree.
+
+
 ## v8.22.0 (2026-06-06)
 
 ### Features
