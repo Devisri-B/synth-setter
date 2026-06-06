@@ -1,6 +1,173 @@
 # CHANGELOG
 
 
+## v8.27.0 (2026-06-06)
+
+### Build System
+
+- **tart**: Local helper to validate/build the macOS VM template
+  ([#1540](https://github.com/tinaudio/synth-setter/pull/1540),
+  [`fa10b90`](https://github.com/tinaudio/synth-setter/commit/fa10b903dcb2584ce966bb02741d7b70efdf815b))
+
+* build(tart): add local helper to validate/build the macOS VM template
+
+tart/build.sh reproduces the gates in .github/workflows/tart-image-build.yml on a contributor's
+  machine: packer fmt -check + init + validate by default, and the full packer build (pinned to the
+  current HEAD, throwaway VM name) behind --build, so template regressions surface before pushing.
+
+Closes #1539
+
+* docs(tart): surface tart/build.sh in getting-started and doc-map
+
+The § B.3 "Build the image yourself" walkthrough listed the raw packer commands the helper now wraps
+  but never mentioned the helper; add a short pointer, and list build.sh in the tart/** doc-map
+  covers string.
+
+Refs #1539
+
+* build(tart): fail fast on non-Apple-Silicon host / missing tart
+
+--build drives Tart's Virtualization.framework, which only runs on Apple Silicon macOS and needs the
+  tart CLI. Guard both with actionable messages instead of leaving Packer/Tart to emit a cryptic
+  downstream error.
+
+Addresses Copilot review feedback on PR #1540. Refs #1539
+
+* build(tart): reject extra arguments after the first
+
+Argument parsing only inspected $1, so an unknown flag after a valid one (e.g. `--build --nope`) was
+  silently ignored. Reject any invocation with more than one argument so misuse errors with exit 2.
+
+* build(tart): harden --build preflights and packer hint
+
+Address Copilot's second-round review on PR #1540: - Detect Apple Silicon via `sysctl
+  hw.optional.arm64` so --build still works under Rosetta (where `uname -m` misreports x86_64). -
+  Fail with an actionable message when git HEAD can't be resolved (non-repo / git absent) instead of
+  letting `set -e` abort on a raw git error. - Point the missing-packer hint at the official install
+  docs (the validate path is host-agnostic), keeping the Homebrew command as an example.
+
+### Continuous Integration
+
+- Make pre-PR review gate worktree-aware
+  ([#1538](https://github.com/tinaudio/synth-setter/pull/1538),
+  [`9831fda`](https://github.com/tinaudio/synth-setter/commit/9831fda66dd546c256b2ef2fbe1daac56e0a6cc0))
+
+The pre-PR review gate runs as a PreToolUse hook from the primary checkout, always on the default
+  branch, so for the mandated worktree workflow it was unsatisfiable: it resolved the REVIEW_FULL
+  path against the primary cwd (the sentinel lives in the worktree) and ran the ancestry and
+  first-parent lag checks against the primary HEAD (=main, not the branch tip), so it always
+  blocked.
+
+Derive the evaluated ref and base dir from the command's --head branch: ancestry/lag run against the
+  branch tip (local refs/heads/<b>, else refs/remotes/origin/<b>), and a relative REVIEW_FULL path
+  absent from cwd resolves against that branch's worktree root. Every existing safety check is
+  preserved unchanged; only the ref/dir each evaluates against moved. Fail-safe: an unresolvable
+  --head keeps the strict HEAD/cwd behavior, and absent --head the legacy path is unchanged.
+
+Fixes #1536
+
+### Features
+
+- **eval**: Pin wandb checkpoint refs in predict configs
+  ([#1534](https://github.com/tinaudio/synth-setter/pull/1534),
+  [`f851141`](https://github.com/tinaudio/synth-setter/commit/f851141d986af33c9110d863a37852af72eaf518))
+
+* feat(eval): pin wandb checkpoint refs in predict configs
+
+Wire ckpt_path: ${wandb:tinaudio/synth-setter/model-<config_id>:latest} into the eight surge predict
+  experiment configs (config_id == experiment basename, per resolve_run_config_id), retiring the
+  shell-based checkpoint fetch in favour of the ${wandb:...} OmegaConf resolver landed in #1504.
+
+- Pin ckpt_path on ffn/flow/flow_mlp/vae × full/simple experiment configs. - Migrate all 18
+  jobs/predict/*.sh launchers off get-ckpt-from-wandb.sh; they now inherit the config-pinned
+  ckpt_path (datamodule variants reuse the same model artifact). - Delete
+  jobs/predict/get-ckpt-from-wandb.sh and its shellcheck exclude. - Add a parametrized test proving
+  each wired experiment resolves ckpt_path to its model-<id> artifact with a faked wandb (no
+  network). - Update the predict baseline-compare test: the live scripts inherit ${wandb:...}, so
+  force both sides to a local ckpt via EXTRA_HYDRA_OVERRIDE (else --resolve would hit W&B) and
+  accept the post-v0.0.0 consumed_* lineage keys; treat ckpt_path as volatile in the test-mps
+  config-shape guard. - Refresh docs/design/eval-pipeline.md (resolver + wiring now implemented) and
+  doc-map.yaml.
+
+Refs #128
+
+* chore(eval): tighten ckpt-wiring comments per comment-hygiene
+
+Trim the flow_simple ckpt_path comment to two lines and drop nested parens from the doc-map
+  resolver/launcher entries.
+
+* fix(eval): isolate wandb ckpt pin in predict-only overlay
+
+Pinning `ckpt_path: ${wandb:...}` directly in the shared `surge/<id>` experiment made train.yaml
+  inherit it: `train.py` reads `cfg.get("ckpt_path")` into `trainer.fit`, so `train
+  experiment=surge/ffn_full` eagerly resolved the W&B artifact (needing an API key, absent on the
+  MPS runner) and would silently resume from the published model. This reds
+  `test_train_surge_xt[mps-surge/ffn_full]` and is the code-health/synth-setter/tdd/ml-test block on
+  #1534.
+
+Move the pin into predict-only `experiment/surge/wandb_checkpoint/<id>` overlays that compose the
+  shared experiment and add only `ckpt_path`; `mode=predict` stays in the launcher call. Train
+  composes `surge/<id>` (no ckpt, no resolution); predict launchers compose
+  `surge/wandb_checkpoint/<id>`. Leaf configs include the base via the absolute
+  `/experiment/surge/base` so the overlay can nest them.
+
+Tests: - fast `test_train_surge_experiment_composes_null_ckpt_without_wandb_resolution` guard
+  (regular CI) — train base pins no ckpt and fires no resolver. - live W&B round-trips (MPS/GPU,
+  gated on WANDB_API_KEY): eval predict downloads a real artifact and runs inference; train resumes
+  from a `${wandb:...}` ckpt. Helper publishes a smoke checkpoint to a dedicated
+  `synth-setter-citest` project under the key's own entity, never the production model registry. -
+  repoint the resolver composition test at the wandb_checkpoint overlay.
+
+Wire WANDB_API_KEY into the MPS and GPU test workflows; docs/doc-map updated.
+
+* test(eval): move train-path wandb guard out of the entrypoint module
+
+The fast `test_train_surge_experiment_composes_null_ckpt_without_wandb_resolution` guard composed
+  `train.yaml` via `initialize_config_module`, which the entrypoint invariant
+  `tests/_meta/test_entrypoint_e2e_only.py` forbids in `test_train.py` (config-composition tests
+  belong outside the canonical entrypoint modules). That reddened the ubuntu/conda/macos jobs.
+
+Relocate the guard to `tests/test_wandb_resolver.py` (a config-layer test module, not an entrypoint)
+  where the same `compose`/`_fake_api` machinery already lives, and parametrize it over all 8 wired
+  surge experiments. `test_train.py` keeps only the live resume round-trip (fixture-driven, no
+  config-initializer import).
+
+* ci(test): re-trigger MPS run after WANDB_API_KEY secret rotation
+
+The prior MPS run read the malformed `WANDB_API_KEY` (job started before the secret was re-added),
+  failing the two live wandb_checkpoint round-trip tests with `AuthenticationError: invalid`. This
+  empty commit starts a fresh `pull_request` run that picks up the corrected secret. No source
+  change.
+
+* fix(test): pin short wandb host for live round-trip on long-hostname CI
+
+`wandb.init()` records the machine hostname and W&B rejects a run whose host exceeds 64 chars:
+  `CommError: invalid parameters: 64 limit exceeded for Host`. The self-hosted MPS/GPU runners have
+  hostnames well over 64 chars, so the live `wandb_checkpoint` round-trip tests failed at init there
+  while passing locally (short hostname). Pin `wandb.Settings(host="synth-setter-ci")` in
+  `publish_checkpoint_artifact` so the recorded host is bounded regardless of runner.
+
+### Testing
+
+- Accept lineage + wandb console keys in baseline diff
+  ([#1544](https://github.com/tinaudio/synth-setter/pull/1544),
+  [`ef2b3bc`](https://github.com/tinaudio/synth-setter/commit/ef2b3bcc1747176452f78c6e855519c426799bf0))
+
+The cpu-slow suite went red on every predict/kosc/surge baseline-config comparison: recent merges
+  added top-level keys to the live train/eval configs absent from the frozen v0.0.0 baseline.
+
+Extend ACCEPTED_DIFFS with the W&B artifact-lineage keys (consumed_train_config_id,
+  consumed_dataset_config_id, consumed_artifact_alias; #1508/#1509), the opt-in training block
+  (#1472, replacing the now-subsumed training.upload_checkpoints_uri entry which strips to an empty
+  dict), and logger.wandb.settings.console (#1506) — each an audit-able non-model-knob divergence.
+
+Add a TestStripDottedKeys unit class pinning the top-level-vs-nested path handling and the
+  asymmetric no-op-when-absent contract in make test-fast, matching the existing TestStripLeafKeys /
+  TestRenameDataGroupToDatamodule coverage pattern.
+
+Refs #1541
+
+
 ## v8.26.1 (2026-06-06)
 
 ### Bug Fixes
