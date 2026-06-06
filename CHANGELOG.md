@@ -1,6 +1,39 @@
 # CHANGELOG
 
 
+## v8.23.2 (2026-06-06)
+
+### Bug Fixes
+
+- **storage**: Make finalize R2 prefix check advisory, not fatal
+  ([#1510](https://github.com/tinaudio/synth-setter/pull/1510),
+  [`b8a9636`](https://github.com/tinaudio/synth-setter/commit/b8a96368763a9040020472ba3292f055461beded))
+
+* fix(storage): make finalize R2 prefix check advisory, not fatal
+
+The #281 write-time guard (assert_r2_prefix_matches in finalize_from_spec) aborted finalize whenever
+  spec.r2.prefix diverged from the canonical data/{task_name}/{run_id}/ shape. But a custom prefix
+  is legitimate — the oracle-eval e2e isolates its objects under test-runs/<test>/<uuid>/, and
+  finalize reads the same prefix generate wrote to, so the spec is self-consistent. The guard could
+  not distinguish intentional override from drift, so it broke the "Generate dataset shards -> real
+  R2 (Docker + VST)" job (test_oracle_eval_inline/shuffled_audio_metrics).
+
+Catch the ValueError and log a warning instead of aborting; the assert_r2_prefix_matches helper and
+  its unit tests are unchanged (still strict for callers that want it). Replaces the obsolete
+  test_finalize_from_spec_drifted_prefix_raises_before_any_upload (which pinned the now-removed
+  abort) with a test that a non-canonical prefix finalizes and lands its artifacts.
+
+Refs #281, #1471
+
+* docs(storage): mark finalize prefix check advisory in flow diagram + helper docstring
+
+doc-drift from the advisory-guard change: configuration-reference.md's finalize flow labeled the
+  prefix step a fatal 'prefix-drift guard'; prefix.py's assert_r2_prefix_matches docstring implied
+  finalize hard-stops. Both now state the check is advisory in finalize (warns, never aborts).
+
+Refs #281
+
+
 ## v8.23.1 (2026-06-06)
 
 ### Bug Fixes
