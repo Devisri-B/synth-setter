@@ -625,12 +625,16 @@ def _render_one_owned_shard(
     :returns: ``(rendered, skipped)`` — exactly one is ``True``.
     """
     shard = spec.shards[shard_id]
-    existing_size = r2_io.object_size(spec.r2.shard_uri(shard))
-    if existing_size is not None and existing_size > 0:
-        logger.info(
-            f"skipping shard {shard.shard_id} — already in R2 "
-            f"({existing_size} bytes): {shard.filename}"
-        )
+    if spec.output_format.is_directory:
+        # Probe the _versions/ manifest, not bare data/ files: a render that
+        # crashed before commit leaves orphan fragments that must not be skipped.
+        already_present = r2_io.r2_directory_exists(f"{spec.r2.shard_uri(shard)}/_versions")
+        existing_size = 0
+    else:
+        existing_size = r2_io.object_size(spec.r2.shard_uri(shard)) or 0
+        already_present = existing_size > 0
+    if already_present:
+        logger.info(f"skipping shard {shard.shard_id} — already in R2: {shard.filename}")
         _log_shard_metrics(loggers, shard_id, byte_size=existing_size, render_seconds=0.0)
         return False, True
     t0 = time.monotonic()
@@ -687,15 +691,32 @@ def _render_and_upload_shard(
                 )
     shard_path = work_dir / shard.filename
     # Surface a generator that exited 0 without writing output here, not as a
-    # downstream rclone "source not found".
-    if not shard_path.is_file():
-        raise RuntimeError(
-            f"generate_vst_dataset.py exited 0 but did not write expected shard file: {shard_path}"
-        )
-    byte_size = shard_path.stat().st_size
-    logger.info(f"shard rendered: {shard_path} ({byte_size} bytes)")
-    _rclone_copy(str(shard_path), r2_dest_prefix)
-    logger.info(f"shard uploaded: {shard.filename} -> {r2_dest_prefix}")
+    # downstream rclone "source not found". Lance shards are directories.
+    if spec.output_format.is_directory:
+        if not shard_path.is_dir():
+            raise RuntimeError(
+                "generate_vst_dataset.py exited 0 but did not write expected shard "
+                f"dataset: {shard_path}"
+            )
+        byte_size = sum(p.stat().st_size for p in shard_path.rglob("*") if p.is_file())
+        logger.info(f"shard rendered: {shard_path} ({byte_size} bytes)")
+        # Upload data first, then the _versions/ manifest last (rclone copy has no
+        # ordering guarantee). The resume skip-probe checks _versions/, so a crash
+        # mid-upload must never leave a manifest whose data files are absent.
+        dest = spec.r2.shard_uri(shard)
+        r2_io.upload_dir(shard_path, dest, exclude="_versions/**")
+        r2_io.upload_dir(shard_path / "_versions", f"{dest}/_versions")
+    else:
+        if not shard_path.is_file():
+            raise RuntimeError(
+                "generate_vst_dataset.py exited 0 but did not write expected shard "
+                f"file: {shard_path}"
+            )
+        byte_size = shard_path.stat().st_size
+        dest = r2_dest_prefix
+        logger.info(f"shard rendered: {shard_path} ({byte_size} bytes)")
+        _rclone_copy(str(shard_path), dest)
+    logger.info(f"shard uploaded: {shard.filename} -> {dest}")
     return byte_size
 
 

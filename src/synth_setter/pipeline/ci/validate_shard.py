@@ -22,8 +22,9 @@ to the HDF5 path (``.h5``), the wds tar path (``.tar``), or the Lance path
 CLI usage:
     python3 -m synth_setter.pipeline.ci.validate_shard <spec.json|r2://bucket/spec.json>
 
-Iterates `spec.shards` and downloads each shard from R2 (under
-`r2://{spec.r2.bucket}/{spec.r2.prefix}{shard.filename}`) before validating.
+Iterates `spec.shards` from R2 (under
+`r2://{spec.r2.bucket}/{spec.r2.prefix}{shard.filename}`): HDF5/WDS shards
+download to a tempfile first, Lance shards stream directly from R2.
 """
 
 from __future__ import annotations
@@ -33,12 +34,15 @@ import re
 import sys
 import tarfile
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import click
 import h5py
 import numpy as np
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    import lance
 
 from synth_setter.data.vst.shapes import (
     DATASET_FIELD_DTYPES,
@@ -314,33 +318,42 @@ def _validate_tar_shard(shard_path: Path, spec: DatasetSpec) -> list[str]:
 
 
 def _validate_lance_shard(shard_path: Path, spec: DatasetSpec) -> list[str]:
-    """Validate a Lance single-file shard's schema, metadata, and row count.
+    """Validate a Lance shard dataset's schema, metadata, and row count.
 
-    :param shard_path: Local filesystem path to the Lance shard.
+    :param shard_path: Local filesystem path to the Lance shard dataset directory.
     :param spec: Dataset spec the shard is expected to conform to.
     :returns: List of error strings (empty = valid).
-    :rtype: list[str]
     """
-    from lance.file import LanceFileReader
-
-    from synth_setter.pipeline.data.lance_shard import read_shard_metadata
+    import lance
 
     try:
-        reader = LanceFileReader(str(shard_path))
-        metadata = reader.metadata()
+        dataset = lance.dataset(str(shard_path))
     except (OSError, ValueError, RuntimeError) as exc:
-        return [f"file is not a valid Lance file: {shard_path}: {exc}"]
+        return [f"path is not a valid Lance dataset: {shard_path}: {exc}"]
+    return _validate_lance_dataset(dataset, spec)
+
+
+def _validate_lance_dataset(dataset: lance.LanceDataset, spec: DatasetSpec) -> list[str]:
+    """Validate an open Lance shard dataset's schema, metadata, and row count.
+
+    Shared by the local-path and direct-from-R2 validators.
+
+    :param dataset: Open Lance dataset handle for one shard.
+    :param spec: Dataset spec the shard is expected to conform to.
+    :returns: List of error strings (empty = valid).
+    """
+    from synth_setter.pipeline.data.lance_shard import read_shard_metadata
 
     errors: list[str] = []
-    schema = metadata.schema
+    schema = dataset.schema
     try:
         read_shard_metadata(schema)
     except ValueError as exc:
         errors.append(str(exc))
 
-    num_rows = reader.num_rows()
+    num_rows = dataset.count_rows()
     if num_rows != spec.render.samples_per_shard:
-        errors.append(f"file has {num_rows} rows, expected {spec.render.samples_per_shard}")
+        errors.append(f"dataset has {num_rows} rows, expected {spec.render.samples_per_shard}")
 
     expected_shapes = _expected_dataset_shapes(spec)
     for name in DATASET_FIELD_NAMES:
@@ -487,19 +500,50 @@ def _load_spec(spec_arg: str) -> DatasetSpec:
 
 
 def validate_all_shards_from_r2(spec: DatasetSpec) -> list[str]:
-    """Validate every shard in ``spec.shards`` by downloading from R2.
+    """Validate every shard in ``spec.shards`` from R2.
+
+    HDF5/WDS shards download to a tempfile before validating; Lance shards
+    short-circuit to :func:`_validate_all_lance_shards_from_r2`, which streams
+    each dataset directly from R2 (no local download).
 
     :param spec: Dataset spec whose ``shards`` list drives the iteration; each
-        listed shard is fetched from R2 under ``r2://{spec.r2.bucket}/{spec.r2.prefix}``.
+        listed shard lives under ``r2://{spec.r2.bucket}/{spec.r2.prefix}``.
     :returns: Aggregated error strings across all shards (empty = all valid). Each
         error is prefixed with the shard filename so the source is obvious.
-    :rtype: list[str]
     """
+    if spec.output_format is OutputFormat.LANCE:
+        return _validate_all_lance_shards_from_r2(spec)
+
     errors: list[str] = []
     for shard in spec.shards:
         shard_object_uri = spec.r2.shard_uri(shard)
         with downloaded_to_tempfile(shard_object_uri) as local_shard:
             shard_errors = validate_shard(local_shard, spec)
+        for err in shard_errors:
+            errors.append(f"{shard.filename}: {err}")
+    return errors
+
+
+def _validate_all_lance_shards_from_r2(spec: DatasetSpec) -> list[str]:
+    """Validate every Lance shard by streaming it directly from R2 via ``storage_options``.
+
+    :param spec: Dataset spec whose ``shards`` list drives the iteration.
+    :returns: Aggregated error strings across all shards, each prefixed with the
+        shard filename.
+    """
+    import lance
+
+    from synth_setter.pipeline import r2_io
+
+    storage_options = r2_io.r2_storage_options()
+    errors: list[str] = []
+    for shard in spec.shards:
+        s3_uri = r2_io.to_s3_uri(spec.r2.shard_uri(shard))
+        try:
+            dataset = lance.dataset(s3_uri, storage_options=storage_options)
+            shard_errors = _validate_lance_dataset(dataset, spec)
+        except (OSError, ValueError, RuntimeError) as exc:
+            shard_errors = [f"path is not a valid Lance dataset: {s3_uri}: {exc}"]
         for err in shard_errors:
             errors.append(f"{shard.filename}: {err}")
     return errors
