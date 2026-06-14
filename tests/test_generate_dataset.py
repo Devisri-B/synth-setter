@@ -117,6 +117,23 @@ def test_cfg_dataset_copy_dataset_root_uri_with_wds_output_is_rejected(
         spec_from_cfg(cfg_dataset)
 
 
+def test_cfg_dataset_render_obxf_resolves_param_spec_through_spec_from_cfg(
+    cfg_dataset_obxf: DictConfig,
+) -> None:
+    """``render=obxf`` resolves its registered spec through the ``spec_from_cfg`` entrypoint path.
+
+    ``num_params`` is ``len(param_specs[param_spec_name])`` — the registry lookup
+    the shard writer makes — so a resolving width proves the entrypoint reaches the
+    OB-Xf spec without a ``KeyError`` (P31 e2e gate for the new ``render`` group).
+
+    :param cfg_dataset_obxf: Function-scoped fixture composing ``dataset.yaml`` with
+        the smoke-shard experiment, ``render=obxf``, and ``tmp_path``-pinned paths.
+    """
+    spec = spec_from_cfg(cfg_dataset_obxf)
+    assert spec.render.param_spec_name == "obxf"
+    assert spec.num_params == 187
+
+
 @pytest.mark.fake_vst
 @pytest.mark.parametrize(
     ("output_format", "shard_suffix"),
