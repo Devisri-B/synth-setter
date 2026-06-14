@@ -1,6 +1,139 @@
 # CHANGELOG
 
 
+## v8.36.0 (2026-06-14)
+
+### Features
+
+- **data-pipeline**: Migrate Lance to Dataset API + direct-R2 finalize
+  ([#1699](https://github.com/tinaudio/synth-setter/pull/1699),
+  [`fb114a6`](https://github.com/tinaudio/synth-setter/commit/fb114a6129c223ddfd345e11f637796787672fc2))
+
+* feat(data-pipeline): migrate Lance integration to the Dataset API
+
+Replace the single-file lance.file API with lance.write_dataset/lance.dataset: shards and splits
+  become Lance dataset directories. Pin data_storage_version to "2.1" so the on-disk format no
+  longer floats with the pylance default.
+
+Sequential paths (finalize, stats, validate) now stream directly from R2 via storage_options;
+  finalize writes each split straight to its s3:// URI, dropping the per-shard download and split
+  upload. The training dataloader keeps the rclone local-first transport and gains unordered fancy
+  indexing (LanceDataset .take preserves request order). Worker uploads and existence probes are
+  made directory-aware via OutputFormat.is_directory and r2_io.r2_directory_exists.
+
+Refs #1693
+
+* test(data-pipeline): cover Lance Dataset API migration end-to-end
+
+Unit: OutputFormat.is_directory, r2_directory_exists, data_storage_version pin,
+
+unordered fancy indexing, directory read/validate. Real-R2 (is_r2_reachable): finalize_lance streams
+  a shard from R2 into a split written back to s3://, and the launcher roundtrip now covers the
+  lance format end-to-end (worker directory upload + direct-from-R2 validate). Update the worker
+  orchestrator test's shard verification and skip-probe to the directory contract.
+
+* docs(data-pipeline): align Lance migration design doc with worker upload
+
+Worker upload is rclone copy with a directory-named dest plus an r2_directory_exists skip-probe
+  (keyed off OutputFormat.is_directory), not r2_io.upload_dir as first drafted.
+
+* fix(data-pipeline): probe committed Lance shards by manifest, fix path-guard tests
+
+The worker resume skip-probe checked any object under the shard prefix, so a render that crashed
+  after LanceFragment.create but before commit_lance_dataset left orphan data/ files that were
+  skipped forever yet failed to open. Probe the _versions/ manifest instead so only committed shards
+  skip.
+
+Tests: rewrite the LanceShardFile path guard for the new directory contract (reject a single file,
+  not a directory) and add a direct lance_fragment + commit_lance_dataset round-trip pinning rows,
+  order, and data_storage_version.
+
+* refactor(data-pipeline): upload Lance shards via upload_dir; doc/comment fixups
+
+Use r2_io.upload_dir for the worker's directory shard upload so it gets the wide directory-upload IO
+  timeout (a multi-fragment shard can outlast the 300s single-file default). Correct the writers
+  module docstring and the design-doc R2-layout note to the dataset-directory contract.
+
+* chore(data-pipeline): address pre-PR review for Lance migration
+
+Drop a stray metrics/metrics.json test artifact and gitignore metrics/. Pin the LanceVSTDataModule
+  directory-open contract in the train e2e test and reference LANCE_DATA_STORAGE_VERSION instead of
+  a literal in the R2 finalize test. Probe the shard _versions/ manifest with --max-depth=1 (O(1)
+  existence check), and tighten the flagged comments/docstrings.
+
+* test(data-pipeline): pin manifest skip-probe + r2 error propagation; tidy API
+
+Worker resume test now probes the committed _versions/ manifest (matching production), catching a
+  regression where the manifest is never written. Add the r2_directory_exists non-zero-exit
+  propagation test. Thread storage_options through lance_fragment/commit_lance_dataset for parity
+  with the other Lance writers, and drop a what-not-why conftest comment.
+
+* chore(data-pipeline): clear pre-PR review round 4 (DRY, docstrings)
+
+Delete the private _r2_to_s3_uri duplicate in finalize and route its caller to r2_io.to_s3_uri.
+  Correct the lance_shard module docstring (dataset shards, not single files) and the stale
+  record_batch_from_arrays return reference. Compress the flagged docstrings to the contract + a
+  rationale line and drop historical narrative.
+
+* fix(data-pipeline): upload Lance data before the _versions manifest
+
+rclone copy has no intra-tree ordering guarantee, so the _versions/ manifest could land before its
+  data/ files; a crash mid-upload then left the resume skip-probe seeing a complete-looking shard
+  whose data was absent. Upload data/ (and _transactions/) first via upload_dir --exclude, then the
+  _versions/ manifest last, so _versions/ exists iff the shard's data is fully present.
+
+* chore(data-pipeline): correct r2_directory_exists probe comment
+
+rclone lsf is non-recursive by default, so --max-depth=1 was a no-op and the comment overstated it.
+  Drop the flag and document the actual behavior. Remove a dead returncode assignment in the
+  empty-listing test.
+
+* docs(data-pipeline): sync docs to Lance dataset-directory model
+
+doc-drift after the Dataset API migration: the doc-map lance_shard entry named the removed
+  write_lance_file (defeating its grep-detection) and data-pipeline.md (scoped by the design doc's
+  Phase 6) still described single-file shards + the removed LanceFileWriter. Update doc-map
+  (lance_shard/r2_io/spec covers), data-pipeline.md, training-pipeline.md, and the
+  implementation-plan doc.
+
+Refs #1684
+
+* docs(data-pipeline): apply Copilot review nits on the Lance migration
+
+Fix the stream_stats_lance empty-input message (URIs, not paths), the r2_directory_exists test
+  docstring (non-recursive lsf), and two design-doc descriptions (r2_storage_options reads env
+  without calling ensure_r2_env_loaded; iter_lance_column_rows uses
+  dataset.to_batches(columns=...)).
+
+* fix(data-pipeline): treat blank R2 credential env vars as missing
+
+r2_storage_options() keyed presence on 'in os.environ', so a present-but-empty RCLONE_CONFIG_R2_*
+  var built a partial storage_options dict that failed opaquely on the first S3/Lance call. Reject
+  empty/whitespace values up front with the actionable message, and cover it with a regression test.
+
+* ci(data-pipeline): verify the Lance split as a dataset directory
+
+The finalize-verify step grepped `rclone ls --max-depth 1` for a `train.lance` file, but a Lance
+  split is now a dataset directory — rclone ls lists files only, so the directory never matched and
+  the lance smoke failed despite finalize writing train.lance/ correctly (confirmed in R2). Check
+  the directory via `rclone lsf ${PREFIX}train.lance/` instead.
+
+* docs(data-pipeline): correct validate/finalize docstrings for Lance streaming
+
+Copilot flagged validate_all_shards_from_r2's docstring claiming it downloads every shard, but Lance
+  short-circuits to direct-from-R2 streaming. Fix that and the finalize + validate module
+  docstrings, which likewise described the Lance branch as download-and-concatenate rather than
+  stream-and-write-back.
+
+* test(data-pipeline): resolve the Lance finalize split as a dataset directory
+
+The finalize-artifact oracle resolved train.lance via object_size + a single-file download, but a
+  Lance split is a dataset directory — object_size's rclone lsf returns '0\n0\n0' (the
+  data/_versions/_transactions subdirs) and int() raises. Probe with r2_directory_exists and pull
+  the tree via download_dir_no_overwrite; LanceShardFile then reads it. Validated against a real
+  finalized R2 run.
+
+
 ## v8.35.0 (2026-06-14)
 
 ### Chores
