@@ -1,6 +1,101 @@
 # CHANGELOG
 
 
+## v8.35.0 (2026-06-14)
+
+### Chores
+
+- **ci-automation**: Require Python 3.11, drop 3.10 support
+  ([#1692](https://github.com/tinaudio/synth-setter/pull/1692),
+  [`bae26c4`](https://github.com/tinaudio/synth-setter/commit/bae26c4ef27015a8f98bdb5b7ac44b244b009b66))
+
+### Features
+
+- **data-pipeline**: Register OB-Xf as second VST3 synth
+  ([#1696](https://github.com/tinaudio/synth-setter/pull/1696),
+  [`f7d21cc`](https://github.com/tinaudio/synth-setter/commit/f7d21ccbdefe14d96f3e412c1289bd047dbfef4c))
+
+* feat(data-pipeline): register OB-Xf as second synth (ParamSpec, preset, render config)
+
+Onboard OB-Xf as the second registered synth end-to-end. The spec was drafted by
+  synth-setter-introspect-plugin, then hand-pruned of 9 params that are provably inert or harmful
+  under the render harness's single note_on/note_off, monophonic, no-pitch-bend playback
+  (core.make_midi_events): bypass, the three pitch_bend_* params, polyphony_voices, glide,
+  glide_slop, note_priority, and envelope_legato_mode. The remaining 94 synth params encode to width
+  187 (down from 234).
+
+Adds registry coverage (presence, preset existence, sample/encode/decode round-trip, pruned-param
+  absence) and a render=obxf Hydra compose test asserting the RenderConfig identity fields.
+
+CI-matrix and Docker parameterization are deferred to PR2.
+
+Refs #1597 Part of #1582
+
+* test(data-pipeline): strengthen OB-Xf round-trip assertions and fix registry docstring
+
+Round-trip test now pins encoded shape (187,), float32 dtype, and value equality (not just key
+  sets), so a decode that returns correct keys with wrong values no longer passes. Refresh the
+  registry module docstring to list obxf_param_spec among the pulled pedalboard-free modules, and
+  assert preset_path in the render=obxf compose test.
+
+* test(data-pipeline): pin OB-Xf encoded ranges and prune stale draft comments
+
+Round-trip test now asserts the encoded tensor stays in [0, 1] with no NaN/Inf (MT2), and the count
+  test pins synth_param_length == 184 so a categorical-for-bool swap that preserves the object count
+  still fails. Trim the introspection draft scaffolding (Draft/Hand-tune/Source-path preambles) now
+  that the spec is tuned and registered.
+
+* test(data-pipeline): add OB-Xf entrypoint e2e gate and tighten docstrings
+
+Add an entrypoint-level test composing render=obxf through spec_from_cfg and asserting num_params
+  resolves to 187 — the same registry lookup the shard writer makes, so it proves the pipeline
+  reaches the OB-Xf spec without a KeyError (P31 gate for the new Hydra group). Round-trip test now
+  also pins decoded key sets and note_param_length; the compose test asserts an inherited surge_xt
+  knob. Drop baked-in counts and narration from docstrings.
+
+* test(data-pipeline): move OB-Xf registry-resolution assertion to config layer
+
+The entrypoint module tests/test_generate_dataset.py is barred by the
+  _meta/test_entrypoint_e2e_only.py guard from importing Hydra config initializers, so fold the
+  num_params==187 registry-resolution check into the existing render=obxf compose test under
+  tests/pipeline/configs/ instead. Drop the redundant module enumeration from the registry
+  docstring.
+
+* chore(comments): collapse OB-Xf test docstrings per pre-PR review
+
+Pre-PR comment-hygiene flagged two C5 multi-line test docstrings; collapse each to a single contract
+  sentence so the REVIEW_COMMENT_GATE opens.
+
+Refs #1597
+
+* test(data-pipeline): add render=obxf entrypoint test via conftest fixture
+
+Resolves the synth-setter-project-standards P31 gate for the new render=obxf config: the
+  second-synth test must live in tests/test_generate_dataset.py, but that module is barred from
+  Hydra config-initializer imports by tests/_meta/test_entrypoint_e2e_only.py. Compose render=obxf
+  in a new cfg_dataset_obxf conftest fixture and assert OB-Xf's registered width (187) flows through
+  spec_from_cfg, satisfying both invariants.
+
+* test(data-pipeline): drop duplicate OB-Xf render=obxf entrypoint test
+
+The P31 fix added a render=obxf spec_from_cfg gate, but an earlier draft of the same test was left
+  in place with a byte-for-byte identical body (same cfg_dataset_obxf fixture, same param_spec_name
+  and num_params==187 asserts). Keep the survivor whose docstring names the P31 KeyError gate; drop
+  the redundant copy.
+
+* test(data-pipeline): pin float32 tolerance in OB-Xf round-trip
+
+encode() stores float32, so decode(encode(x)) drifts ~1e-7 from the float64 samples. Replace the
+  blanket pytest.approx (default rel=1e-6, brittle near zero) with an explicit abs=1e-6 tolerance on
+  the continuous values and an exact int check on pitch, per Copilot review.
+
+### Refactoring
+
+- **data-pipeline**: Decode Lance tensors via pyarrow built-in
+  ([#1693](https://github.com/tinaudio/synth-setter/pull/1693),
+  [`f08b207`](https://github.com/tinaudio/synth-setter/commit/f08b207c5738ca2470e2b0c2915b5426ca07161a))
+
+
 ## v8.34.0 (2026-06-12)
 
 ### Chores
