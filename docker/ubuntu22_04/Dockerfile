@@ -291,7 +291,8 @@ RUN curl -fsSL \
 # Python base: Python + venv on top of the chosen Surge install.
 # ==========================================
 FROM builder-install-surge-from-${BUILD_MODE} AS python-base
-# Check that vst3 was installed.
+# Surge XT is the only bundle present here; the amd64-only fetched synths land
+# downstream (vst3-synths-fetch COPY), gated and load-validated there.
 RUN ls /usr/lib/vst3/ && test -n "$(ls -A /usr/lib/vst3/Surge\ XT.vst3 2>/dev/null)" \
     || (echo "ERROR: Surge XT.vst3 not found in /usr/lib/vst3/" >&2; exit 1)
 
@@ -328,6 +329,9 @@ RUN python --version && \
 # Both dev and final-stage inherit from this stage.
 # ==========================================
 FROM python-base AS builder-install-synth-setter-deps
+# Re-declare the predefined platform ARG so ${TARGETARCH} resolves in this
+# stage's RUN steps; buildkit does not inherit ARG across FROM.
+ARG TARGETARCH
 # Install Python dependencies via `uv sync --frozen` against the committed
 # lockfile. uv's cache (mounted below) persists torch wheels (~2.5 GB)
 # across builds. Cache scope: only pyproject.toml + uv.lock + README.md
@@ -413,6 +417,16 @@ RUN mkdir -p /home/build/synth-setter/plugins && \
 
 COPY --from=vst3-synths-fetch /plugins-staging/ /usr/lib/vst3/
 COPY --from=synth-setter-src /home/build/synth-setter/src/synth_setter/scripts/load_vst3_check.py /artifacts/
+
+# Presence gate for the bundles the image must ship: Surge XT on every arch,
+# OB-Xf on amd64 only (the fetched synths are amd64-only). Load-validation follows.
+RUN for bundle in "Surge XT" "OB-Xf"; do \
+      if [[ "$bundle" == "OB-Xf" && "${TARGETARCH:-}" != "amd64" ]]; then \
+        echo "skipping ${bundle}.vst3 presence check on ${TARGETARCH:-<unset>}" >&2; continue; \
+      fi; \
+      [[ -d "/usr/lib/vst3/${bundle}.vst3" ]] \
+        || { echo "ERROR: ${bundle}.vst3 not found in /usr/lib/vst3/" >&2; exit 1; }; \
+    done
 
 # Validate each fetched synth loads under headless X11 — one wrapper run per
 # plugin, since sequential in-process loads crash order-dependently (#1649) —
