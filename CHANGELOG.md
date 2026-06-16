@@ -1,6 +1,73 @@
 # CHANGELOG
 
 
+## v8.39.0 (2026-06-16)
+
+### Features
+
+- **data-pipeline**: Add audio_mp3 preview-column CLI for Lance datasets
+  ([#1718](https://github.com/tinaudio/synth-setter/pull/1718),
+  [`0b093d3`](https://github.com/tinaudio/synth-setter/commit/0b093d3220f2d09b684e91548913560df4dcbabe))
+
+* feat(data-pipeline): add audio_mp3 preview-column CLI for Lance datasets
+
+Add `synth-setter-add-mp3-audio` (src/synth_setter/pipeline/data/add_mp3_audio.py), a standalone CLI
+  that backfills a per-row `audio_mp3` preview column onto an existing Lance dataset written by
+  generate-dataset or finalize-dataset.
+
+Each row's raw `audio` tensor (float16 `(channels, time)`) is encoded to a CBR MP3 with pedalboard
+  (already a dependency — no new deps) and stored as a Lance blob v2 column tagged `mime_type:
+  audio/mpeg`, so viewers auto-play it and per-row reads stay lazy. The column is added via Lance's
+  `batch_udf`-driven `add_columns`, which backfills in place without rewriting existing columns; the
+  sample rate is read from the shard's embedded `ShardMetadata`. The MP3 is a lossy preview artifact
+  — never a training input.
+
+Also adds notebooks/add_mp3_audio.ipynb: a smoke run that builds a tiny Lance dataset, runs the add
+  step, and renders a params + MP3 dataframe.
+
+This is a post-hoc batch tool rather than the inline-at-generation/finalize approach the issues
+  propose, so it partially addresses both.
+
+Refs #1697 Refs #1682
+
+* build(deps): sync uv.lock to 8.38.0 after merging main
+
+* fix(data-pipeline): credential bare s3:// URIs as R2 in add-mp3-audio
+
+Mirror add_embeddings._open_lance_dataset: treat any s3:// URI as the project's R2 endpoint and
+  attach r2_storage_options, rather than only crediting r2:// URIs. R2 datasets are commonly
+  referenced as s3:// in this repo, so the prior path failed when only RCLONE_CONFIG_R2_* creds were
+  set.
+
+* test(data-pipeline): stub ensure_r2_env_loaded in add-mp3-audio r2 test
+
+The r2:// main() path now resolves to s3:// and calls ensure_r2_env_loaded, which raises without R2
+  creds (and runs an rclone auth ping). Stub it so the test is hermetic and passes in CI, matching
+  the new bare-s3 test.
+
+* docs(data-pipeline): correct add-mp3-audio doc-map type; robustify frame-sync test
+
+- doc-map called the audio_mp3 column 'large_binary', but it is a Lance blob v2 column
+  (lance.blob_field / lance.blob_array); reword and backtick tokens to match adjacent entries. -
+  Frame-sync test scans the head for the sync word instead of requiring it at byte 0, since a valid
+  MP3 may lead with an ID3 tag or padding.
+
+### Refactoring
+
+- Adopt Python 3.11 datetime.UTC and builtin TimeoutError
+  ([#1735](https://github.com/tinaudio/synth-setter/pull/1735),
+  [`a1fce12`](https://github.com/tinaudio/synth-setter/commit/a1fce12d6d44a06bc86fc46076c3cc9c6738c031))
+
+ruff modernizations (behavior-preserving) split out of the add_embeddings PR (#1720), where they
+  were accidentally swept in by a `git add -A`:
+
+- `datetime.timezone.utc` → `datetime.UTC` - `asyncio.TimeoutError` → builtin `TimeoutError` (an
+  alias since 3.11)
+
+across pipeline schemas / run_id / subprocess_stream and the tests that construct UTC datetimes. No
+  runtime behavior changes.
+
+
 ## v8.38.0 (2026-06-16)
 
 ### Features
