@@ -389,7 +389,7 @@ class KSinFlowMatchingModule(LightningModule):
                 batch_size=batch_size,
             )
 
-        return loss + penalty
+        return loss if penalty is None else loss + penalty
 
     def on_train_epoch_end(self) -> None:
         pass
